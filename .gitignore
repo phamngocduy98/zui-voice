@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+.idea/
+.vscode/
+*.log
+*.part
+src-tauri/gen/
+
+# The local model/runtime are development inputs, not source artifacts.
+bin/*.gguf
+bin/*.exe

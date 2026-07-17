@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="72" y1="48" x2="440" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171922"/>
+      <stop offset="0.52" stop-color="#0D0F16"/>
+      <stop offset="1" stop-color="#05060A"/>
+    </linearGradient>
+    <linearGradient id="voice" x1="150" y1="132" x2="365" y2="386" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B8FFDA"/>
+      <stop offset="0.48" stop-color="#63F4BC"/>
+      <stop offset="1" stop-color="#47BFF5"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feComposite in="blur" in2="SourceGraphic" operator="over"/>
+    </filter>
+  </defs>
+  <rect x="28" y="28" width="456" height="456" rx="116" fill="url(#bg)"/>
+  <rect x="29" y="29" width="454" height="454" rx="115" fill="none" stroke="#FFFFFF" stroke-opacity=".12" stroke-width="2"/>
+  <g fill="url(#voice)" filter="url(#glow)">
+    <rect x="218" y="122" width="76" height="210" rx="38"/>
+    <path d="M164 245a16 16 0 0 1 32 0v28c0 34 27 61 60 61s60-27 60-61v-28a16 16 0 1 1 32 0v28c0 46-33 85-76 92v34h39a16 16 0 1 1 0 32H201a16 16 0 1 1 0-32h39v-34c-43-8-76-46-76-92v-28Z"/>
+  </g>
+  <g fill="#FFFFFF" opacity=".8">
+    <rect x="100" y="236" width="12" height="40" rx="6"/>
+    <rect x="126" y="216" width="12" height="80" rx="6"/>
+    <rect x="374" y="216" width="12" height="80" rx="6"/>
+    <rect x="400" y="236" width="12" height="40" rx="6"/>
+  </g>
+</svg>
