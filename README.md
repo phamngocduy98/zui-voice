@@ -32,13 +32,13 @@ The React UI receives typed state and spectrum events from a Rust controller. Na
 
 ## Release assets
 
-Set `ZUI_RELEASE_MANIFEST_URL` at build time to a public HTTPS JSON manifest following `src-tauri/assets/release-manifest.example.json`. Every asset is selected by OS/architecture and verified before installation. Do not publish the supplied GGUF until its exact provenance and redistribution terms have been verified.
+Release builds default to the versioned manifest in their matching GitHub release (for example, `v0.1.0/release-manifest.json`). `ZUI_RELEASE_MANIFEST_URL` can override that location at runtime or build time. Every asset is selected by OS/architecture and verified before installation. Model and runtime attribution is recorded in `THIRD_PARTY_NOTICES.md`.
 
 ## Platform notes
 
 - Windows 10/11 x64 is the primary locally verified target.
-- macOS requires Microphone and Accessibility permissions.
-- X11 supports global key observation and synthetic paste subject to desktop security policy.
+- macOS requires Microphone and Accessibility permissions. Until native foreground-window validation is implemented, transcripts are copied for manual paste rather than injected into a potentially different app.
+- X11 currently uses the same safe copy-for-manual-paste fallback; global key observation remains subject to desktop security policy.
 - Wayland intentionally falls back to copying the transcript for manual paste. A portal-configured `Ctrl+Alt+Space` chord is the intended packaged integration.
 
 ## Privacy

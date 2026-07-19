@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "release": "0.1.0",
   "engineVersion": "0.4.0",
-  "licenseNoticeUrl": "https://github.com/OWNER/zui-voice/blob/v0.1.0/THIRD_PARTY_NOTICES.md",
+  "licenseNoticeUrl": "https://github.com/phamngocduy98/zui-voice/blob/v0.1.0/THIRD_PARTY_NOTICES.md",
   "assets": [
     {
       "id": "model-vietnamese-q8",
@@ -10,7 +10,7 @@
       "platform": "all",
       "arch": "all",
       "filename": "parakeet-ctc-0.6b-Vietnamese-q8_0.gguf",
-      "url": "https://github.com/OWNER/zui-voice/releases/download/v0.1.0/parakeet-ctc-0.6b-Vietnamese-q8_0.gguf",
+      "url": "https://github.com/phamngocduy98/zui-voice/releases/download/v0.1.0/parakeet-ctc-0.6b-Vietnamese-q8_0.gguf",
       "size": 875450720,
       "sha256": "0cd89039faa3936641569ba9d76733461c3930ee33128aad206840dde4e79338"
     },
@@ -20,7 +20,7 @@
       "platform": "windows",
       "arch": "x86_64",
       "filename": "parakeet-server.exe",
-      "url": "https://github.com/OWNER/zui-voice/releases/download/v0.1.0/parakeet-server.exe",
+      "url": "https://github.com/phamngocduy98/zui-voice/releases/download/v0.1.0/parakeet-server.exe",
       "size": 169654784,
       "sha256": "d85f0d9cabeb2e245b99157a2672e31e7ac8fac4c8ac9b144e5aa154c4b523e2"
     }

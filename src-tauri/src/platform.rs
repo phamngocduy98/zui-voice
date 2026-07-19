@@ -27,19 +27,22 @@ pub fn capture_foreground() -> ForegroundTarget {
         }
     }
     #[cfg(not(windows))]
-    ForegroundTarget { native_id: 1 }
+    ForegroundTarget { native_id: 0 }
 }
 
 pub fn target_is_current(target: ForegroundTarget) -> bool {
     #[cfg(windows)]
     unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() as isize
-            == target.native_id
+        target.native_id != 0
+            && windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() as isize
+                == target.native_id
     }
     #[cfg(not(windows))]
     {
         let _ = target;
-        true
+        // Until the platform-specific active-window identity can be captured
+        // reliably, copying is safer than injecting text into a different app.
+        false
     }
 }
 

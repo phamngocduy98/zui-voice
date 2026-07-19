@@ -4,6 +4,8 @@ export interface HotkeyBinding {
   key: string;
   consume: boolean;
 }
+export type ThemePreference = "system" | "light" | "dark";
+
 export interface AppSettings {
   hotkey: HotkeyBinding;
   inputDeviceName: string | null;
@@ -13,6 +15,8 @@ export interface AppSettings {
   maxRecordingSeconds: number;
   modelIdleTimeoutSeconds: number;
   enabled: boolean;
+  theme: ThemePreference;
+  onboardingVersion: number;
 }
 
 export interface BackendDescriptor {
@@ -44,6 +48,7 @@ export interface AppSnapshot {
   state: DictationState;
   backend: BackendDescriptor;
   setupComplete: boolean;
+  onboardingComplete: boolean;
   platform: string;
   wayland: boolean;
 }
@@ -58,6 +63,7 @@ export interface SetupStatus {
 }
 
 export interface DownloadProgress {
+  phase: "fetchingManifest" | "downloading" | "verifying" | "installing";
   asset: string;
   received: number;
   total: number | null;

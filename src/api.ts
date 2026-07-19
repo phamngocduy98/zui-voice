@@ -19,7 +19,9 @@ const fallback: AppSnapshot = {
     clipboardRestore: true,
     maxRecordingSeconds: 300,
     modelIdleTimeoutSeconds: 600,
-    enabled: true
+    enabled: true,
+    theme: "system",
+    onboardingVersion: 1
   },
   state: { phase: "idle", backendStatus: "stopped" },
   backend: {
@@ -29,6 +31,7 @@ const fallback: AppSnapshot = {
     model: "parakeet-ctc-0.6b-Vietnamese-q8_0.gguf"
   },
   setupComplete: true,
+  onboardingComplete: true,
   platform: "browser",
   wayland: false
 };
@@ -51,6 +54,28 @@ export async function listInputDevices(): Promise<string[]> {
   return inTauri() ? invoke("list_input_devices") : ["Default microphone"];
 }
 
+export async function testMicrophone(preferredName: string | null): Promise<void> {
+  if (inTauri()) await invoke("test_microphone", { preferredName });
+}
+
+export async function beginHotkeyTest(): Promise<void> {
+  if (inTauri()) await invoke("begin_hotkey_test");
+}
+
+export async function getHotkeyTestStatus(): Promise<boolean> {
+  return inTauri() ? invoke("get_hotkey_test_status") : false;
+}
+
+export async function cancelHotkeyTest(): Promise<void> {
+  if (inTauri()) await invoke("cancel_hotkey_test");
+}
+
+export async function completeOnboarding(inputDeviceName: string | null): Promise<AppSnapshot> {
+  return inTauri()
+    ? invoke("complete_onboarding", { inputDeviceName })
+    : fallback;
+}
+
 export async function startAssetDownload(): Promise<SetupStatus> {
   return invoke("download_assets");
 }
@@ -59,12 +84,14 @@ export async function cancelAssetDownload(): Promise<void> {
   if (inTauri()) await invoke("cancel_asset_download");
 }
 
-export async function unloadModel(): Promise<void> {
-  if (inTauri()) await invoke("unload_model");
+export async function unloadModel(): Promise<AppSnapshot> {
+  return inTauri()
+    ? invoke("unload_model")
+    : { ...fallback, state: { phase: "idle", backendStatus: "stopped" } };
 }
 
-export async function retryBackend(): Promise<void> {
-  if (inTauri()) await invoke("retry_backend");
+export async function retryBackend(): Promise<AppSnapshot> {
+  return inTauri() ? invoke("retry_backend") : fallback;
 }
 
 export async function debugStart(): Promise<void> {
@@ -85,4 +112,8 @@ export async function onSpectrum(handler: (bins: number[]) => void): Promise<Unl
 
 export async function onDownload(handler: (value: DownloadProgress) => void): Promise<UnlistenFn> {
   return inTauri() ? listen<DownloadProgress>("voice://download-progress", (event) => handler(event.payload)) : () => undefined;
+}
+
+export async function onHotkeyTest(handler: () => void): Promise<UnlistenFn> {
+  return inTauri() ? listen("voice://hotkey-test", handler) : () => undefined;
 }

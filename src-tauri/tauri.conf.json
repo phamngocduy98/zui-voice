@@ -19,9 +19,10 @@
         "height": 700,
         "minWidth": 620,
         "minHeight": 560,
+        "decorations": true,
         "center": true,
         "resizable": true,
-        "visible": true
+        "visible": false
       },
       {
         "label": "overlay",
@@ -39,7 +40,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {

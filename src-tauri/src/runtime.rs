@@ -10,6 +10,7 @@ use crate::{
     settings::SettingsStore,
     types::{
         AppError, AppResult, AppSettings, AppSnapshot, BackendStatus, DictationState, SetupStatus,
+        CURRENT_ONBOARDING_VERSION,
     },
 };
 use std::{
@@ -30,20 +31,26 @@ pub struct AppRuntime {
     recorder: AudioRecorder,
     clipboard: ClipboardService,
     state: RwLock<DictationState>,
+    transition: Mutex<()>,
     activation: ActivationGate,
-    cancelled: AtomicBool,
-    session: AtomicU64,
-    target: Mutex<Option<ForegroundTarget>>,
+    model_unloading: AtomicBool,
+    microphone_verified: AtomicBool,
+    hotkey_probe_armed: AtomicBool,
+    hotkey_verified: AtomicBool,
+    next_session: AtomicU64,
+    current_session: AtomicU64,
+    target: Mutex<Option<(u64, ForegroundTarget)>>,
 }
 
 #[derive(Default)]
 struct ActivationGate {
     busy: AtomicBool,
     key_down: AtomicBool,
+    owner: AtomicU64,
 }
 
 impl ActivationGate {
-    fn try_begin(&self) -> bool {
+    fn try_begin(&self, session: u64) -> bool {
         if self.key_down.swap(true, Ordering::AcqRel) {
             return false;
         }
@@ -55,21 +62,46 @@ impl ActivationGate {
             self.key_down.store(false, Ordering::Release);
             return false;
         }
+        self.owner.store(session, Ordering::Release);
         true
     }
 
-    fn release_for_finish(&self) -> bool {
-        self.key_down.swap(false, Ordering::AcqRel) && self.busy.load(Ordering::Acquire)
+    fn release_for_finish(&self) -> Option<u64> {
+        if !self.key_down.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let owner = self.owner.load(Ordering::Acquire);
+        (owner != 0 && self.busy.load(Ordering::Acquire)).then_some(owner)
     }
 
-    fn cancel(&self) -> bool {
-        self.key_down.store(false, Ordering::Release);
-        self.busy.swap(false, Ordering::AcqRel)
+    fn release_session_for_finish(&self, session: u64) -> bool {
+        self.owner.load(Ordering::Acquire) == session
+            && self.key_down.swap(false, Ordering::AcqRel)
+            && self.owner.load(Ordering::Acquire) == session
+            && self.busy.load(Ordering::Acquire)
     }
 
-    fn complete(&self) {
+    fn cancel(&self) -> Option<u64> {
+        let owner = self.owner.swap(0, Ordering::AcqRel);
+        if owner == 0 {
+            return None;
+        }
         self.key_down.store(false, Ordering::Release);
         self.busy.store(false, Ordering::Release);
+        Some(owner)
+    }
+
+    fn complete(&self, session: u64) -> bool {
+        if self
+            .owner
+            .compare_exchange(session, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.key_down.store(false, Ordering::Release);
+        self.busy.store(false, Ordering::Release);
+        true
     }
 
     fn is_busy(&self) -> bool {
@@ -99,16 +131,23 @@ impl AppRuntime {
             recorder: AudioRecorder::new(app),
             clipboard: ClipboardService::new(),
             state: RwLock::new(initial),
+            transition: Mutex::new(()),
             activation: ActivationGate::default(),
-            cancelled: AtomicBool::new(false),
-            session: AtomicU64::new(0),
+            model_unloading: AtomicBool::new(false),
+            microphone_verified: AtomicBool::new(false),
+            hotkey_probe_armed: AtomicBool::new(false),
+            hotkey_verified: AtomicBool::new(false),
+            next_session: AtomicU64::new(0),
+            current_session: AtomicU64::new(0),
             target: Mutex::new(None),
         }))
     }
 
     pub fn snapshot(&self) -> AppSnapshot {
+        let settings = self.settings.get();
         AppSnapshot {
-            settings: self.settings.get(),
+            onboarding_complete: settings.onboarding_version >= CURRENT_ONBOARDING_VERSION,
+            settings,
             state: self.state.read().expect("state lock poisoned").clone(),
             backend: self.backend.descriptor(),
             setup_complete: self.assets.status().complete,
@@ -127,97 +166,232 @@ impl AppRuntime {
     }
 
     pub fn update_settings(&self, settings: AppSettings) -> AppResult<AppSnapshot> {
+        let should_cancel = self.settings.get().enabled && !settings.enabled;
         self.settings.save(settings)?;
+        if should_cancel {
+            self.cancel();
+        }
+        Ok(self.snapshot())
+    }
+
+    pub fn test_microphone(&self, preferred_name: Option<&str>) -> AppResult<()> {
+        let _transition = self.transition.lock().expect("transition lock poisoned");
+        if self.activation.is_busy() {
+            return Err(AppError::new(
+                "dictation_active",
+                "Finish the current dictation before testing the microphone.",
+            ));
+        }
+        self.microphone_verified.store(false, Ordering::Release);
+        let session = self.next_session.fetch_add(1, Ordering::AcqRel) + 1;
+        self.recorder.start(session, preferred_name, 1)?;
+        std::thread::sleep(Duration::from_millis(400));
+        self.recorder.finish_test(session)?;
+        self.microphone_verified.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn begin_hotkey_test(&self) -> AppResult<()> {
+        if self.activation.is_busy() {
+            return Err(AppError::new(
+                "dictation_active",
+                "Finish the current dictation before testing the shortcut.",
+            ));
+        }
+        self.hotkey_verified.store(false, Ordering::Release);
+        self.hotkey_probe_armed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn hotkey_test_passed(&self) -> bool {
+        self.hotkey_verified.load(Ordering::Acquire)
+    }
+
+    pub fn cancel_hotkey_test(&self) {
+        self.hotkey_probe_armed.store(false, Ordering::Release);
+    }
+
+    pub fn complete_onboarding(&self, input_device_name: Option<String>) -> AppResult<AppSnapshot> {
+        if !self.assets.status().complete {
+            return Err(AppError::new(
+                "setup_incomplete",
+                "Install the speech engine and Vietnamese model first.",
+            ));
+        }
+        if !self.microphone_verified.load(Ordering::Acquire) {
+            return Err(AppError::new(
+                "microphone_not_verified",
+                "Test microphone access before completing setup.",
+            ));
+        }
+        if self.backend.status() != BackendStatus::Ready {
+            return Err(AppError::new(
+                "backend_not_verified",
+                "Verify the local speech engine before completing setup.",
+            ));
+        }
+        let mut settings = self.settings.get();
+        settings.input_device_name = input_device_name;
+        settings.onboarding_version = CURRENT_ONBOARDING_VERSION;
+        self.update_settings(settings)
+    }
+
+    pub async fn unload_model(&self) -> AppResult<AppSnapshot> {
+        self.model_unloading.store(true, Ordering::Release);
+        {
+            let _transition = self.transition.lock().expect("transition lock poisoned");
+            self.current_session.store(0, Ordering::Release);
+            let _ = self.activation.cancel();
+            self.recorder.cancel();
+            self.backend.cancel();
+            self.target.lock().expect("target lock poisoned").take();
+            hide_overlay(&self.app);
+        }
+        let shutdown = self.backend.shutdown().await;
+        {
+            let _transition = self.transition.lock().expect("transition lock poisoned");
+            self.set_state(DictationState::Idle {
+                backend_status: self.backend.status(),
+            });
+            self.model_unloading.store(false, Ordering::Release);
+        }
+        shutdown?;
+        Ok(self.snapshot())
+    }
+
+    pub async fn retry_backend(&self) -> AppResult<AppSnapshot> {
+        self.backend.ensure_ready().await?;
+        let _transition = self.transition.lock().expect("transition lock poisoned");
+        if !self.activation.is_busy() {
+            self.set_state(DictationState::Idle {
+                backend_status: self.backend.status(),
+            });
+        }
         Ok(self.snapshot())
     }
 
     pub fn press(self: &Arc<Self>) {
+        if self.hotkey_probe_armed.swap(false, Ordering::AcqRel) {
+            self.hotkey_verified.store(true, Ordering::Release);
+            let _ = self.app.emit("voice://hotkey-test", ());
+            return;
+        }
+        let _transition = self.transition.lock().expect("transition lock poisoned");
         let settings = self.settings.get();
-        if !settings.enabled || !self.assets.status().complete {
+        if self.model_unloading.load(Ordering::Acquire)
+            || !settings.enabled
+            || !self.assets.status().complete
+            || settings.onboarding_version < CURRENT_ONBOARDING_VERSION
+        {
             return;
         }
-        if !self.activation.try_begin() {
+        let session = self.next_session.fetch_add(1, Ordering::AcqRel) + 1;
+        if !self.activation.try_begin(session) {
             return;
         }
-        self.cancelled.store(false, Ordering::Release);
-        self.backend.reset_cancellation();
-        let session = self.session.fetch_add(1, Ordering::AcqRel) + 1;
-        *self.target.lock().expect("target lock poisoned") = Some(capture_foreground());
+        self.current_session.store(session, Ordering::Release);
+        *self.target.lock().expect("target lock poisoned") = Some((session, capture_foreground()));
         if let Err(error) = position_and_show_overlay(&self.app) {
-            self.fail(error);
+            self.fail_locked(session, error);
             return;
         }
-        if let Err(error) = self.recorder.start(settings.input_device_name.as_deref()) {
-            self.fail(error);
+        if let Err(error) = self.recorder.start(
+            session,
+            settings.input_device_name.as_deref(),
+            settings.max_recording_seconds,
+        ) {
+            self.fail_locked(session, error);
             return;
         }
         self.set_state(DictationState::Recording { elapsed_ms: 0 });
 
-        let backend = self.backend.clone();
+        let runtime = self.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = backend.ensure_ready().await;
+            let _ = runtime.backend.ensure_ready().await;
+            let _transition = runtime.transition.lock().expect("transition lock poisoned");
+            if !runtime.activation.is_busy() && !runtime.model_unloading.load(Ordering::Acquire) {
+                runtime.set_state(DictationState::Idle {
+                    backend_status: runtime.backend.status(),
+                });
+            }
         });
 
         let runtime = self.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_secs(settings.max_recording_seconds)).await;
-            if runtime.session.load(Ordering::Acquire) == session
-                && runtime.activation.release_for_finish()
+            if runtime.is_current(session) && runtime.activation.release_session_for_finish(session)
             {
-                runtime.finish().await;
+                runtime.finish(session).await;
             }
         });
     }
 
     pub fn release(self: &Arc<Self>) {
-        if !self.activation.release_for_finish() {
+        let Some(session) = self.activation.release_for_finish() else {
             return;
-        }
+        };
         let runtime = self.clone();
-        tauri::async_runtime::spawn(async move { runtime.finish().await });
+        tauri::async_runtime::spawn(async move { runtime.finish(session).await });
     }
 
     pub fn cancel(&self) {
-        if !self.activation.cancel() {
+        let _transition = self.transition.lock().expect("transition lock poisoned");
+        if self.activation.cancel().is_none() {
             return;
         }
-        self.cancelled.store(true, Ordering::Release);
-        self.session.fetch_add(1, Ordering::AcqRel);
+        self.current_session.store(0, Ordering::Release);
         self.recorder.cancel();
         self.backend.cancel();
+        self.target.lock().expect("target lock poisoned").take();
         self.set_state(DictationState::Idle {
             backend_status: self.backend.status(),
         });
         hide_overlay(&self.app);
     }
 
-    async fn finish(self: Arc<Self>) {
-        let artifact = match self.recorder.stop() {
+    async fn finish(self: Arc<Self>, session: u64) {
+        if !self.is_current(session) {
+            return;
+        }
+        let artifact = match self.recorder.stop(session) {
             Ok(artifact) => artifact,
             Err(error) => {
-                self.fail(error);
+                if self.is_current(session) {
+                    self.fail(session, error);
+                }
                 return;
             }
         };
-        if self.cancelled.load(Ordering::Acquire) {
+        if !self.is_current(session) {
             remove_private_file(&artifact.path).await;
             return;
         }
-        if self.backend.status() != BackendStatus::Ready {
-            self.set_state(DictationState::Loading {
-                detail: "Loading the Vietnamese model".into(),
-            });
+        if self.backend.status() != BackendStatus::Ready
+            && !self.set_state_for(
+                session,
+                DictationState::Loading {
+                    detail: "Loading the Vietnamese model".into(),
+                },
+            )
+        {
+            remove_private_file(&artifact.path).await;
+            return;
         }
         if let Err(error) = self.backend.ensure_ready().await {
             remove_private_file(&artifact.path).await;
-            self.fail(error);
+            if self.is_current(session) {
+                self.fail(session, error);
+            }
             return;
         }
-        if self.cancelled.load(Ordering::Acquire) {
+        if !self.is_current(session) {
             remove_private_file(&artifact.path).await;
             return;
         }
-        self.set_state(DictationState::Transcribing);
+        if !self.set_state_for(session, DictationState::Transcribing) {
+            remove_private_file(&artifact.path).await;
+            return;
+        }
         let result = self
             .backend
             .transcribe(TranscriptionRequest {
@@ -229,65 +403,109 @@ impl AppRuntime {
         let result = match result {
             Ok(value) => value,
             Err(error) => {
-                self.fail(error);
+                if self.is_current(session) {
+                    self.fail(session, error);
+                }
                 return;
             }
         };
-        if self.cancelled.load(Ordering::Acquire) {
-            self.complete_idle();
+        if !self.is_current(session) {
             return;
         }
-        self.set_state(DictationState::Pasting);
-        let target = self
-            .target
-            .lock()
-            .expect("target lock poisoned")
-            .take()
-            .unwrap_or_else(capture_foreground);
-        match self
+        if !self.set_state_for(session, DictationState::Pasting) {
+            return;
+        }
+        let Some(target) = self.take_target(session) else {
+            return;
+        };
+        let delivery = match self
             .clipboard
             .deliver(result.text, target, self.settings.get().clipboard_restore)
             .await
         {
-            Ok(Delivery::Pasted) => self.set_state(DictationState::Success),
-            Ok(Delivery::Copied(reason)) => self.set_state(DictationState::Copied { reason }),
+            Ok(value) => value,
             Err(error) => {
-                self.fail(error);
+                if self.is_current(session) {
+                    self.fail(session, error);
+                }
+                return;
+            }
+        };
+        {
+            let _transition = self.transition.lock().expect("transition lock poisoned");
+            if !self.is_current(session) {
+                return;
+            }
+            match delivery {
+                Delivery::Pasted => self.set_state(DictationState::Success),
+                Delivery::Copied(reason) => self.set_state(DictationState::Copied { reason }),
+            }
+            if !self.activation.complete(session) {
                 return;
             }
         }
-        self.activation.complete();
         let runtime = self.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_millis(950)).await;
-            hide_overlay(&runtime.app);
-            runtime.set_state(DictationState::Idle {
-                backend_status: runtime.backend.status(),
-            });
+            let _transition = runtime.transition.lock().expect("transition lock poisoned");
+            if runtime.is_current(session) {
+                hide_overlay(&runtime.app);
+                runtime.set_state(DictationState::Idle {
+                    backend_status: runtime.backend.status(),
+                });
+            }
         });
     }
 
-    fn fail(self: &Arc<Self>, error: AppError) {
+    fn fail(self: &Arc<Self>, session: u64, error: AppError) {
+        let _transition = self.transition.lock().expect("transition lock poisoned");
+        self.fail_locked(session, error);
+    }
+
+    fn fail_locked(self: &Arc<Self>, session: u64, error: AppError) {
+        if !self.is_current(session) {
+            return;
+        }
+        self.recorder.cancel_session(session);
+        self.take_target(session);
         eprintln!("Zui. Voice error [{}]: {}", error.code, error.message);
-        self.recorder.cancel();
-        self.activation.complete();
         self.set_state(DictationState::Error { error });
+        if !self.activation.complete(session) {
+            return;
+        }
         let runtime = self.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            hide_overlay(&runtime.app);
-            runtime.set_state(DictationState::Idle {
-                backend_status: runtime.backend.status(),
-            });
+            let _transition = runtime.transition.lock().expect("transition lock poisoned");
+            if runtime.is_current(session) {
+                hide_overlay(&runtime.app);
+                runtime.set_state(DictationState::Idle {
+                    backend_status: runtime.backend.status(),
+                });
+            }
         });
     }
 
-    fn complete_idle(&self) {
-        self.activation.complete();
-        self.set_state(DictationState::Idle {
-            backend_status: self.backend.status(),
-        });
-        hide_overlay(&self.app);
+    fn is_current(&self, session: u64) -> bool {
+        self.current_session.load(Ordering::Acquire) == session
+    }
+
+    fn set_state_for(&self, session: u64, state: DictationState) -> bool {
+        let _transition = self.transition.lock().expect("transition lock poisoned");
+        if !self.is_current(session) {
+            return false;
+        }
+        self.set_state(state);
+        true
+    }
+
+    fn take_target(&self, session: u64) -> Option<ForegroundTarget> {
+        let mut target = self.target.lock().expect("target lock poisoned");
+        if target.as_ref().is_some_and(|(owner, _)| *owner == session) {
+            target.take().map(|(_, target)| target)
+        } else {
+            None
+        }
     }
 
     pub fn start_idle_supervisor(self: &Arc<Self>) {
@@ -301,10 +519,16 @@ impl AppRuntime {
                     && runtime.backend.status() == BackendStatus::Ready
                     && idle >= timeout
                 {
+                    let session = runtime.current_session.load(Ordering::Acquire);
                     let _ = runtime.backend.shutdown().await;
-                    runtime.set_state(DictationState::Idle {
-                        backend_status: BackendStatus::Stopped,
-                    });
+                    let _transition = runtime.transition.lock().expect("transition lock poisoned");
+                    if runtime.current_session.load(Ordering::Acquire) == session
+                        && !runtime.activation.is_busy()
+                    {
+                        runtime.set_state(DictationState::Idle {
+                            backend_status: runtime.backend.status(),
+                        });
+                    }
                 }
             }
         });
@@ -312,9 +536,16 @@ impl AppRuntime {
 }
 
 async fn remove_private_file(path: &Path) {
-    if let Err(error) = tokio::fs::remove_file(path).await {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            let _ = error;
+    for attempt in 0..3 {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if attempt == 2 => {
+                eprintln!("Zui. Voice could not remove private audio: {error}");
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
 }
@@ -333,26 +564,36 @@ mod tests {
     #[test]
     fn repeated_press_is_debounced() {
         let gate = ActivationGate::default();
-        assert!(gate.try_begin());
-        assert!(!gate.try_begin());
-        assert!(gate.release_for_finish());
+        assert!(gate.try_begin(1));
+        assert!(!gate.try_begin(2));
+        assert_eq!(gate.release_for_finish(), Some(1));
     }
 
     #[test]
     fn press_while_busy_does_not_latch_the_key() {
         let gate = ActivationGate::default();
-        assert!(gate.try_begin());
-        assert!(gate.release_for_finish());
-        assert!(!gate.try_begin());
-        gate.complete();
-        assert!(gate.try_begin());
+        assert!(gate.try_begin(1));
+        assert_eq!(gate.release_for_finish(), Some(1));
+        assert!(!gate.try_begin(2));
+        assert!(gate.complete(1));
+        assert!(gate.try_begin(3));
     }
 
     #[test]
     fn cancel_resets_activation() {
         let gate = ActivationGate::default();
-        assert!(gate.try_begin());
-        assert!(gate.cancel());
-        assert!(gate.try_begin());
+        assert!(gate.try_begin(1));
+        assert_eq!(gate.cancel(), Some(1));
+        assert!(gate.try_begin(2));
+    }
+
+    #[test]
+    fn stale_completion_cannot_release_a_new_activation() {
+        let gate = ActivationGate::default();
+        assert!(gate.try_begin(1));
+        assert_eq!(gate.cancel(), Some(1));
+        assert!(gate.try_begin(2));
+        assert!(!gate.complete(1));
+        assert!(gate.is_busy());
     }
 }

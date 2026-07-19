@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Zui. Voice",
+        "width": 720,
+        "height": 700,
+        "minWidth": 620,
+        "minHeight": 560,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 17, "y": 21 },
+        "center": true,
+        "resizable": true,
+        "visible": false
+      },
+      {
+        "label": "overlay",
+        "url": "index.html?view=overlay",
+        "width": 280,
+        "height": 64,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "focus": false,
+        "visible": false,
+        "shadow": false
+      }
+    ]
+  }
+}

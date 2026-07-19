@@ -2,10 +2,7 @@ use crate::{
     platform::{is_wayland, target_is_current, ForegroundTarget},
     types::{AppError, AppResult},
 };
-use clipboard_rs::{
-    common::{ClipboardContent, ContentFormat},
-    Clipboard, ClipboardContext,
-};
+use clipboard_rs::{common::ContentFormat, Clipboard, ClipboardContext};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,27 +37,34 @@ impl ClipboardService {
             let context = ClipboardContext::new()
                 .map_err(|e| AppError::new("clipboard_open", e.to_string()))?;
             let snapshot = if restore {
-                context
-                    .get(&[
-                        ContentFormat::Text,
-                        ContentFormat::Html,
-                        ContentFormat::Rtf,
-                        ContentFormat::Image,
-                        ContentFormat::Files,
-                    ])
-                    .unwrap_or_default()
+                Some(
+                    context
+                        .get(&[
+                            ContentFormat::Text,
+                            ContentFormat::Html,
+                            ContentFormat::Rtf,
+                            ContentFormat::Image,
+                            ContentFormat::Files,
+                        ])
+                        .map_err(|e| AppError::new("clipboard_snapshot", e.to_string()))?,
+                )
             } else {
-                Vec::<ClipboardContent>::new()
+                None
             };
             context
                 .set_text(text.clone())
                 .map_err(|e| AppError::new("clipboard_write", e.to_string()))?;
-            simulate_paste()?;
+            if simulate_paste().is_err() {
+                return Ok(Delivery::Copied(
+                    "Paste unavailable · paste manually".into(),
+                ));
+            }
             std::thread::sleep(Duration::from_millis(220));
-            if restore && should_restore(context.get_text().ok().as_deref(), &text) {
-                if snapshot.is_empty() {
+            if let Some(snapshot) = snapshot {
+                let current = context.get_text().ok();
+                if should_restore(current.as_deref(), &text) && snapshot.is_empty() {
                     let _ = context.clear();
-                } else {
+                } else if should_restore(current.as_deref(), &text) {
                     context
                         .set(snapshot)
                         .map_err(|e| AppError::new("clipboard_restore", e.to_string()))?;
@@ -100,10 +104,12 @@ fn simulate_paste() -> AppResult<()> {
         })
     };
     send(EventType::KeyPress(modifier))?;
-    send(EventType::KeyPress(Key::KeyV))?;
-    send(EventType::KeyRelease(Key::KeyV))?;
-    send(EventType::KeyRelease(modifier))?;
-    Ok(())
+    let result = send(EventType::KeyPress(Key::KeyV));
+    // Always release both keys after a partial injection failure so a failed
+    // paste cannot leave the user's modifier state stuck.
+    let key_release = send(EventType::KeyRelease(Key::KeyV));
+    let modifier_release = send(EventType::KeyRelease(modifier));
+    result.and(key_release).and(modifier_release)
 }
 
 #[cfg(test)]

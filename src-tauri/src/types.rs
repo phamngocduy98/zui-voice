@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub const CURRENT_ONBOARDING_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BackendStatus {
@@ -18,6 +20,15 @@ pub struct HotkeyBinding {
     pub consume: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -30,6 +41,8 @@ pub struct AppSettings {
     pub max_recording_seconds: u64,
     pub model_idle_timeout_seconds: u64,
     pub enabled: bool,
+    pub theme: ThemePreference,
+    pub onboarding_version: u32,
 }
 
 impl Default for AppSettings {
@@ -46,6 +59,8 @@ impl Default for AppSettings {
             max_recording_seconds: 300,
             model_idle_timeout_seconds: 600,
             enabled: true,
+            theme: ThemePreference::System,
+            onboarding_version: 0,
         }
     }
 }
@@ -142,6 +157,7 @@ pub struct AppSnapshot {
     pub state: DictationState,
     pub backend: BackendDescriptor,
     pub setup_complete: bool,
+    pub onboarding_complete: bool,
     pub platform: String,
     pub wayland: bool,
 }
@@ -159,7 +175,17 @@ pub struct SetupStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum DownloadPhase {
+    FetchingManifest,
+    Downloading,
+    Verifying,
+    Installing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DownloadProgress {
+    pub phase: DownloadPhase,
     pub asset: String,
     pub received: u64,
     pub total: Option<u64>,
