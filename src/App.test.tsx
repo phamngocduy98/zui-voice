@@ -54,6 +54,21 @@ describe("Zui. Voice settings shell", () => {
     expect(screen.queryByRole("heading", { name: "Dictation" })).toBeNull();
   });
 
+  it("changes and saves the global hold key", async () => {
+    const update = vi.spyOn(api, "updateSettings");
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "Dictation" })).toBeTruthy();
+
+    const recorder = screen.getByRole("button", { name: /Hold key: Right Alt/ });
+    fireEvent.click(recorder);
+    expect(recorder.textContent).toBe("Press a key...");
+    fireEvent.keyDown(recorder, { key: "F8", code: "F8" });
+
+    await vi.waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      hotkey: expect.objectContaining({ key: "F8" })
+    })));
+  });
+
   it.each([
     ["macos-aarch64", "macos", "Right Option", true],
     ["windows-x86_64", "windows", "Right Alt", false],
@@ -91,14 +106,33 @@ describe("Zui. Voice settings shell", () => {
     expect(windowApi.toggleMaximize).toHaveBeenCalledOnce();
   });
 
-  it("uses the platform hotkey label in the recording overlay", async () => {
+  it("renders the overlay as a spectrum-only chip", async () => {
     const snapshot = await api.getSnapshot();
     vi.spyOn(api, "getSnapshot").mockResolvedValue({ ...snapshot, platform: "macos-aarch64" });
     window.history.replaceState({}, "", "/?view=overlay");
 
-    render(<App />);
+    const { container } = render(<App />);
 
-    expect(await screen.findByText("Hold Right Option")).toBeTruthy();
+    await vi.waitFor(() => expect(container.querySelector(".spectrum")).not.toBeNull());
+    expect(screen.queryByText("Hold Right Option")).toBeNull();
+    expect(container.querySelector(".overlay-copy")).toBeNull();
+  });
+
+  it("replaces the spectrum with error text", async () => {
+    const snapshot = await api.getSnapshot();
+    vi.spyOn(api, "getSnapshot").mockResolvedValue({
+      ...snapshot,
+      state: {
+        phase: "error",
+        error: { code: "microphone", message: "Microphone is unavailable", recoverable: true }
+      }
+    });
+    window.history.replaceState({}, "", "/?view=overlay");
+
+    const { container } = render(<App />);
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Microphone is unavailable");
+    expect(container.querySelector(".spectrum")).toBeNull();
   });
 
   it("supports light, dark, and live system appearance", async () => {
@@ -125,10 +159,11 @@ describe("Zui. Voice settings shell", () => {
 
     fireEvent.click(screen.getByRole("radio", { name: "System" }));
     expect(document.documentElement.dataset.theme).toBe("light");
+    expect(windowApi.setTheme).toHaveBeenLastCalledWith(null);
     systemIsDark = true;
     themeListener?.();
     expect(document.documentElement.dataset.theme).toBe("dark");
-    expect(windowApi.setTheme).toHaveBeenLastCalledWith("dark");
+    expect(windowApi.setTheme).toHaveBeenLastCalledWith(null);
   });
 
   it("updates the model status after unloading", async () => {
@@ -152,7 +187,19 @@ describe("Zui. Voice settings shell", () => {
 
     expect(await screen.findByText("Stopped")).toBeTruthy();
     expect(unload).toHaveBeenCalledOnce();
-    expect(screen.getByRole("button", { name: "Unload" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Load" })).toBeTruthy();
+  });
+
+  it("offers Nemotron's 32 production locales without a redundant model picker", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Local Engine/ }));
+
+    expect(screen.queryByRole("radio")).toBeNull();
+
+    const language = screen.getByRole("combobox", { name: "Transcription language" });
+    expect(language.querySelectorAll("option")).toHaveLength(32);
+    expect(within(language).queryByRole("option", { name: /Hebrew/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Load" })).toBeTruthy();
   });
 
   it("shows a recoverable startup error instead of hanging on the splash screen", async () => {

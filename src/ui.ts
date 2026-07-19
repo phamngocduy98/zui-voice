@@ -1,3 +1,5 @@
+import type { HoldKey } from "./types";
+
 export type UiPlatform = "macos" | "windows" | "linux" | "other";
 
 export const EMPTY_SPECTRUM_BINS = Array.from(
@@ -19,7 +21,15 @@ export function normalizeUiPlatform(platform: string): UiPlatform {
   return "other";
 }
 
-export function formatHotkeyLabel(key: string, platform: UiPlatform) {
+export function formatHotkeyLabel(key: HoldKey, platform: UiPlatform) {
   if (key === "RightAlt") return platform === "macos" ? "Right Option" : "Right Alt";
+  if (key === "RightControl") return "Right Control";
   return key;
+}
+
+export function holdKeyFromCode(code: string): HoldKey | null {
+  if (code === "AltRight") return "RightAlt";
+  if (code === "ControlRight") return "RightControl";
+  if (code === "F8" || code === "F9") return code;
+  return null;
 }

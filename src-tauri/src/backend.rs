@@ -1,6 +1,7 @@
 use crate::{
     assets::AssetManager,
     cancellation::CancellationSignal,
+    models,
     types::{AppError, AppResult, BackendDescriptor, BackendStatus},
 };
 use async_trait::async_trait;
@@ -52,10 +53,11 @@ pub struct ParakeetBackend {
     ensure_lock: AsyncMutex<()>,
     cancellation: CancellationSignal,
     last_used: AtomicU64,
+    active_backend_id: RwLock<String>,
 }
 
 impl ParakeetBackend {
-    pub fn new(assets: Arc<AssetManager>) -> Self {
+    pub fn new(assets: Arc<AssetManager>, backend_id: &str) -> Self {
         Self {
             assets,
             client: reqwest::Client::builder()
@@ -71,7 +73,35 @@ impl ParakeetBackend {
             ensure_lock: AsyncMutex::new(()),
             cancellation: CancellationSignal::default(),
             last_used: AtomicU64::new(now_epoch_seconds()),
+            active_backend_id: RwLock::new(backend_id.into()),
         }
+    }
+
+    pub fn backend_id(&self) -> String {
+        self.active_backend_id
+            .read()
+            .expect("active backend lock poisoned")
+            .clone()
+    }
+
+    pub async fn switch_backend(&self, backend_id: &str) -> AppResult<()> {
+        if models::backend(backend_id).is_none() {
+            return Err(AppError::new(
+                "unsupported_backend",
+                "The selected transcription backend is not supported.",
+            ));
+        }
+        if self.backend_id() == backend_id {
+            return Ok(());
+        }
+        self.cancel();
+        let _guard = self.ensure_lock.lock().await;
+        self.shutdown_process()?;
+        *self
+            .active_backend_id
+            .write()
+            .expect("active backend lock poisoned") = backend_id.into();
+        Ok(())
     }
 
     fn set_status(&self, value: BackendStatus) {
@@ -93,10 +123,11 @@ impl ParakeetBackend {
     }
 
     fn spawn_server(&self) -> AppResult<()> {
-        let paths = self.assets.resolve_paths().ok_or_else(|| {
+        let backend_id = self.backend_id();
+        let paths = self.assets.resolve_paths(&backend_id).ok_or_else(|| {
             AppError::new(
                 "assets_missing",
-                "Parakeet runtime or Vietnamese model is missing.",
+                "The speech runtime or selected model is missing.",
             )
         })?;
         let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -191,8 +222,8 @@ impl ParakeetBackend {
             drop(process_job);
         }
         #[cfg(windows)]
-        if let Some(paths) = self.assets.resolve_paths() {
-            if let Err(error) = windows_process::terminate_exact(&paths.server) {
+        if let Some(server) = self.assets.server_path() {
+            if let Err(error) = windows_process::terminate_exact(&server) {
                 shutdown_error = Some(AppError::new("backend_shutdown", error.to_string()));
             }
         }
@@ -287,10 +318,33 @@ struct TranscriptionResponse {
     text: String,
 }
 
+fn transcription_request(
+    client: &reqwest::Client,
+    base: &str,
+    audio: Vec<u8>,
+    language: &str,
+) -> AppResult<reqwest::RequestBuilder> {
+    let part = reqwest::multipart::Part::bytes(audio)
+        .file_name("recording.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| AppError::new("transcription_request", e.to_string()))?;
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("model", "parakeet")
+        .text("language", language.to_string())
+        .text("response_format", "json");
+    Ok(client
+        .post(format!("{base}/v1/audio/transcriptions"))
+        .multipart(form))
+}
+
 #[async_trait]
 impl TranscriptionBackend for ParakeetBackend {
     fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor::default()
+        let backend_id = self.backend_id();
+        models::backend(&backend_id)
+            .expect("active backend ID should be validated")
+            .descriptor(self.assets.status(&backend_id).complete)
     }
 
     fn status(&self) -> BackendStatus {
@@ -336,23 +390,10 @@ impl TranscriptionBackend for ParakeetBackend {
             .await
             .ok_or_else(Self::cancelled_error)?
             .map_err(|e| AppError::new("audio_read", e.to_string()))?;
-        let part = reqwest::multipart::Part::bytes(audio)
-            .file_name("recording.wav")
-            .mime_str("audio/wav")
-            .map_err(|e| AppError::new("transcription_request", e.to_string()))?;
-        let form = reqwest::multipart::Form::new()
-            .part("file", part)
-            .text("model", "parakeet")
-            .text("language", request.language.to_string())
-            .text("response_format", "json");
         let base = self
             .base_url()
             .ok_or_else(|| AppError::new("backend_unavailable", "Parakeet is not running."))?;
-        let request = self
-            .client
-            .post(format!("{base}/v1/audio/transcriptions"))
-            .multipart(form)
-            .send();
+        let request = transcription_request(&self.client, &base, audio, request.language)?.send();
         let response = self
             .cancellation
             .run(generation, request)
@@ -403,6 +444,74 @@ impl Drop for ParakeetBackend {
         if let Ok(process_job) = self.process_job.get_mut() {
             process_job.take();
         }
+    }
+}
+
+#[cfg(test)]
+mod multipart_tests {
+    use super::transcription_request;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::Duration,
+    };
+
+    #[tokio::test]
+    async fn forwards_the_selected_locale_in_the_multipart_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let received = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set timeout");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end;
+            loop {
+                let count = stream.read(&mut buffer).expect("read request headers");
+                assert!(count > 0, "request ended before headers");
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = index + 4;
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length: ")
+                        .or_else(|| line.strip_prefix("Content-Length: "))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("content length");
+            while bytes.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).expect("read request body");
+                assert!(count > 0, "request ended before body");
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .expect("write response");
+            String::from_utf8_lossy(&bytes[header_end..]).into_owned()
+        });
+
+        let client = reqwest::Client::new();
+        transcription_request(
+            &client,
+            &format!("http://{address}"),
+            b"wav".to_vec(),
+            "en-US",
+        )
+        .expect("build request")
+        .send()
+        .await
+        .expect("send request");
+
+        let body = received.join().expect("request server");
+        assert!(body.contains("name=\"language\""));
+        assert!(body.contains("en-US"));
     }
 }
 

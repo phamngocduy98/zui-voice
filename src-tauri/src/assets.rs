@@ -1,5 +1,6 @@
 use crate::{
     cancellation::CancellationSignal,
+    models,
     types::{AppError, AppResult, DownloadPhase, DownloadProgress, SetupStatus},
 };
 use futures_util::StreamExt;
@@ -14,7 +15,6 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
-pub const MODEL_FILENAME: &str = "parakeet-ctc-0.6b-Vietnamese-q8_0.gguf";
 const DEFAULT_RELEASE_MANIFEST_URL: &str = concat!(
     "https://github.com/phamngocduy98/zui-voice/releases/download/v",
     env!("CARGO_PKG_VERSION"),
@@ -43,6 +43,8 @@ pub struct ReleaseManifest {
 pub struct ReleaseAsset {
     pub id: String,
     pub kind: String,
+    #[serde(default)]
+    pub backend_id: Option<String>,
     pub platform: String,
     pub arch: String,
     pub filename: String,
@@ -74,7 +76,9 @@ impl AssetManager {
         fs::create_dir_all(&install_dir)
             .map_err(|e| AppError::fatal("asset_dir", e.to_string()))?;
         recover_interrupted_install(&install_dir.join(SERVER_FILENAME))?;
-        recover_interrupted_install(&install_dir.join(MODEL_FILENAME))?;
+        for backend in models::BACKENDS {
+            recover_interrupted_install(&install_dir.join(backend.model_filename))?;
+        }
         Ok(Self {
             app: app.clone(),
             install_dir,
@@ -95,26 +99,40 @@ impl AssetManager {
             .or_else(|| Some(DEFAULT_RELEASE_MANIFEST_URL.to_owned()))
     }
 
-    pub fn resolve_paths(&self) -> Option<BackendPaths> {
-        self.path_candidates()
+    pub fn resolve_paths(&self, backend_id: &str) -> Option<BackendPaths> {
+        self.path_candidates(backend_id)
             .into_iter()
             .find(|paths| paths.server.is_file() && paths.model.is_file())
     }
 
-    fn path_candidates(&self) -> Vec<BackendPaths> {
+    pub fn server_path(&self) -> Option<PathBuf> {
+        let installed = self.install_dir.join(SERVER_FILENAME);
+        if installed.is_file() {
+            return Some(installed);
+        }
+        development_roots()
+            .into_iter()
+            .map(|root| root.join("bin").join(SERVER_FILENAME))
+            .find(|path| path.is_file())
+    }
+
+    fn path_candidates(&self, backend_id: &str) -> Vec<BackendPaths> {
+        let Some(backend) = models::backend(backend_id) else {
+            return Vec::new();
+        };
         let mut candidates = vec![BackendPaths {
             server: self.install_dir.join(SERVER_FILENAME),
-            model: self.install_dir.join(MODEL_FILENAME),
+            model: self.install_dir.join(backend.model_filename),
         }];
         candidates.extend(development_roots().into_iter().map(|root| BackendPaths {
             server: root.join("bin").join(SERVER_FILENAME),
-            model: root.join("bin").join(MODEL_FILENAME),
+            model: root.join("bin").join(backend.model_filename),
         }));
         candidates
     }
 
-    pub fn status(&self) -> SetupStatus {
-        let candidates = self.path_candidates();
+    pub fn status(&self, backend_id: &str) -> SetupStatus {
+        let candidates = self.path_candidates(backend_id);
         let complete_paths = candidates
             .iter()
             .find(|paths| paths.server.is_file() && paths.model.is_file());
@@ -127,6 +145,7 @@ impl AssetManager {
             .find(|paths| paths.model.is_file())
             .map(|paths| paths.model.clone());
         SetupStatus {
+            backend_id: backend_id.into(),
             complete: complete_paths.is_some(),
             server_found: server_path.is_some(),
             model_found: model_path.is_some(),
@@ -136,7 +155,13 @@ impl AssetManager {
         }
     }
 
-    pub async fn download(&self) -> AppResult<SetupStatus> {
+    pub async fn download(&self, backend_id: &str) -> AppResult<SetupStatus> {
+        if models::backend(backend_id).is_none() {
+            return Err(AppError::new(
+                "unsupported_backend",
+                "The selected transcription backend is not supported.",
+            ));
+        }
         let _download = self.download_lock.try_lock().map_err(|_| {
             AppError::new(
                 "download_in_progress",
@@ -211,13 +236,13 @@ impl AssetManager {
 
         let platform = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
-        let selected = select_asset_set(&manifest, platform, arch)?;
+        let selected = select_asset_set(&manifest, platform, arch, backend_id)?;
 
         for asset in selected {
             self.ensure_not_cancelled(generation)?;
             self.download_asset(&client, asset, generation).await?;
         }
-        Ok(self.status())
+        Ok(self.status(backend_id))
     }
 
     async fn download_asset(
@@ -459,6 +484,7 @@ fn select_asset_set<'a>(
     manifest: &'a ReleaseManifest,
     platform: &str,
     arch: &str,
+    backend_id: &str,
 ) -> AppResult<[&'a ReleaseAsset; 2]> {
     let matching = |kind: &str| {
         manifest
@@ -471,25 +497,34 @@ fn select_asset_set<'a>(
             })
             .collect::<Vec<_>>()
     };
-    let runtimes = matching("runtime");
-    let models = matching("model");
-    if runtimes.len() != 1 || models.len() != 1 {
+    let runtimes = matching("runtime")
+        .into_iter()
+        .filter(|asset| asset.backend_id.is_none())
+        .collect::<Vec<_>>();
+    let model_assets = matching("model")
+        .into_iter()
+        .filter(|asset| asset.backend_id.as_deref() == Some(backend_id))
+        .collect::<Vec<_>>();
+    if runtimes.len() != 1 || model_assets.len() != 1 {
         return Err(AppError::new(
             "asset_unsupported",
             format!(
-                "Expected one runtime and one model for {platform}/{arch}; found {} and {}.",
+                "Expected one runtime and one {backend_id} model for {platform}/{arch}; found {} and {}.",
                 runtimes.len(),
-                models.len()
+                model_assets.len()
             ),
         ));
     }
-    if runtimes[0].filename != SERVER_FILENAME || models[0].filename != MODEL_FILENAME {
+    let expected_model = models::backend(backend_id)
+        .ok_or_else(|| AppError::new("unsupported_backend", "Unsupported backend."))?
+        .model_filename;
+    if runtimes[0].filename != SERVER_FILENAME || model_assets[0].filename != expected_model {
         return Err(AppError::new(
             "manifest_filename",
             "The manifest filenames do not match the supported runtime and model.",
         ));
     }
-    Ok([runtimes[0], models[0]])
+    Ok([runtimes[0], model_assets[0]])
 }
 
 fn backup_path(destination: &Path) -> PathBuf {
@@ -541,7 +576,7 @@ async fn install_verified_asset(partial: &Path, destination: &Path) -> AppResult
 }
 
 fn validate_manifest(manifest: &ReleaseManifest) -> AppResult<()> {
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != 2 {
         return Err(AppError::new(
             "manifest_version",
             format!(
@@ -578,6 +613,41 @@ fn validate_manifest(manifest: &ReleaseManifest) -> AppResult<()> {
             ));
         }
         validate_https_url(&asset.url, "Release asset URL")?;
+        match asset.kind.as_str() {
+            "runtime" if asset.backend_id.is_some() => {
+                return Err(AppError::new(
+                    "manifest_backend",
+                    "Shared runtime assets cannot declare a backend ID.",
+                ));
+            }
+            "model" => {
+                let Some(backend_id) = asset.backend_id.as_deref() else {
+                    return Err(AppError::new(
+                        "manifest_backend",
+                        "Model assets must declare a backend ID.",
+                    ));
+                };
+                let Some(backend) = models::backend(backend_id) else {
+                    return Err(AppError::new(
+                        "manifest_backend",
+                        format!("{} declares an unsupported backend.", asset.id),
+                    ));
+                };
+                if asset.filename != backend.model_filename {
+                    return Err(AppError::new(
+                        "manifest_filename",
+                        format!("{} does not use the registered model filename.", asset.id),
+                    ));
+                }
+            }
+            "runtime" => {}
+            _ => {
+                return Err(AppError::new(
+                    "manifest_kind",
+                    format!("{} has an unsupported asset kind.", asset.id),
+                ));
+            }
+        }
         if Path::new(&asset.filename)
             .file_name()
             .and_then(|v| v.to_str())
@@ -644,7 +714,7 @@ mod tests {
 
         validate_manifest(&manifest).expect("release manifest should be valid");
         #[cfg(windows)]
-        select_asset_set(&manifest, "windows", "x86_64")
+        select_asset_set(&manifest, "windows", "x86_64", models::NEMOTRON_ID)
             .expect("release manifest should support Windows x64");
         assert_eq!(manifest.release, env!("CARGO_PKG_VERSION"));
         assert!(DEFAULT_RELEASE_MANIFEST_URL.contains(&format!(
@@ -656,16 +726,17 @@ mod tests {
     #[test]
     fn rejects_non_https_assets() {
         let manifest = ReleaseManifest {
-            schema_version: 1,
+            schema_version: 2,
             release: "1".into(),
             engine_version: "1".into(),
             license_notice_url: "https://example.com".into(),
             assets: vec![ReleaseAsset {
                 id: "bad".into(),
                 kind: "model".into(),
+                backend_id: Some(models::NEMOTRON_ID.into()),
                 platform: "all".into(),
                 arch: "all".into(),
-                filename: "model.gguf".into(),
+                filename: models::NEMOTRON_MODEL_FILENAME.into(),
                 url: "http://example.com/model".into(),
                 size: 1,
                 sha256: "0".repeat(64),
@@ -677,16 +748,17 @@ mod tests {
     #[test]
     fn rejects_invalid_checksum_metadata() {
         let manifest = ReleaseManifest {
-            schema_version: 1,
+            schema_version: 2,
             release: "1".into(),
             engine_version: "1".into(),
             license_notice_url: "https://example.com".into(),
             assets: vec![ReleaseAsset {
                 id: "bad-hash".into(),
                 kind: "model".into(),
+                backend_id: Some(models::NEMOTRON_ID.into()),
                 platform: "all".into(),
                 arch: "all".into(),
-                filename: "model.gguf".into(),
+                filename: models::NEMOTRON_MODEL_FILENAME.into(),
                 url: "https://example.com/model".into(),
                 size: 1,
                 sha256: "not-a-sha256".into(),
@@ -703,15 +775,16 @@ mod tests {
         let asset = ReleaseAsset {
             id: "duplicate".into(),
             kind: "model".into(),
+            backend_id: Some(models::NEMOTRON_ID.into()),
             platform: "all".into(),
             arch: "all".into(),
-            filename: MODEL_FILENAME.into(),
+            filename: models::NEMOTRON_MODEL_FILENAME.into(),
             url: "https://example.com/model".into(),
             size: 1,
             sha256: "0".repeat(64),
         };
         let manifest = ReleaseManifest {
-            schema_version: 1,
+            schema_version: 2,
             release: "1".into(),
             engine_version: "1".into(),
             license_notice_url: "https://example.com/license".into(),
@@ -729,7 +802,7 @@ mod tests {
     #[test]
     fn requires_exact_supported_asset_filenames() {
         let manifest = ReleaseManifest {
-            schema_version: 1,
+            schema_version: 2,
             release: "1".into(),
             engine_version: "1".into(),
             license_notice_url: "https://example.com/license".into(),
@@ -737,6 +810,7 @@ mod tests {
                 ReleaseAsset {
                     id: "runtime".into(),
                     kind: "runtime".into(),
+                    backend_id: None,
                     platform: "all".into(),
                     arch: "all".into(),
                     filename: "unexpected-runtime".into(),
@@ -747,9 +821,10 @@ mod tests {
                 ReleaseAsset {
                     id: "model".into(),
                     kind: "model".into(),
+                    backend_id: Some(models::NEMOTRON_ID.into()),
                     platform: "all".into(),
                     arch: "all".into(),
-                    filename: MODEL_FILENAME.into(),
+                    filename: models::NEMOTRON_MODEL_FILENAME.into(),
                     url: "https://example.com/model".into(),
                     size: 1,
                     sha256: "0".repeat(64),
@@ -758,10 +833,55 @@ mod tests {
         };
 
         assert_eq!(
-            select_asset_set(&manifest, std::env::consts::OS, std::env::consts::ARCH)
-                .expect_err("unexpected filename")
-                .code,
+            select_asset_set(
+                &manifest,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                models::NEMOTRON_ID,
+            )
+            .expect_err("unexpected filename")
+            .code,
             "manifest_filename"
         );
+    }
+
+    #[test]
+    fn selects_the_nemotron_model() {
+        let runtime = ReleaseAsset {
+            id: "runtime".into(),
+            kind: "runtime".into(),
+            backend_id: None,
+            platform: "all".into(),
+            arch: "all".into(),
+            filename: SERVER_FILENAME.into(),
+            url: "https://example.com/runtime".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+        };
+        let model = |id: &str, filename: &str| ReleaseAsset {
+            id: format!("model-{id}"),
+            kind: "model".into(),
+            backend_id: Some(id.into()),
+            platform: "all".into(),
+            arch: "all".into(),
+            filename: filename.into(),
+            url: format!("https://example.com/{filename}"),
+            size: 1,
+            sha256: "0".repeat(64),
+        };
+        let manifest = ReleaseManifest {
+            schema_version: 2,
+            release: "1".into(),
+            engine_version: "0.4.0-zui.1".into(),
+            license_notice_url: "https://example.com/license".into(),
+            assets: vec![
+                runtime,
+                model(models::NEMOTRON_ID, models::NEMOTRON_MODEL_FILENAME),
+            ],
+        };
+
+        let selected = select_asset_set(&manifest, "windows", "x86_64", models::NEMOTRON_ID)
+            .expect("Nemotron asset set");
+        assert_eq!(selected[1].backend_id.as_deref(), Some(models::NEMOTRON_ID));
     }
 }

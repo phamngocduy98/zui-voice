@@ -1,15 +1,17 @@
 export type BackendStatus = "missing" | "stopped" | "loading" | "ready" | "error";
 
 export interface HotkeyBinding {
-  key: string;
+  key: HoldKey;
   consume: boolean;
 }
+export type HoldKey = "RightAlt" | "RightControl" | "F8" | "F9";
 export type ThemePreference = "system" | "light" | "dark";
 
 export interface AppSettings {
   hotkey: HotkeyBinding;
   inputDeviceName: string | null;
   backendId: string;
+  locale: string;
   launchAtLogin: boolean;
   clipboardRestore: boolean;
   maxRecordingSeconds: number;
@@ -23,7 +25,16 @@ export interface BackendDescriptor {
   id: string;
   name: string;
   language: string;
+  description: string;
   model: string;
+  installed: boolean;
+  locales: LanguageDescriptor[];
+}
+
+export interface LanguageDescriptor {
+  locale: string;
+  name: string;
+  tier: "transcriptionReady" | "broadCoverage";
 }
 
 export interface AppError {
@@ -47,6 +58,7 @@ export interface AppSnapshot {
   settings: AppSettings;
   state: DictationState;
   backend: BackendDescriptor;
+  backends: BackendDescriptor[];
   setupComplete: boolean;
   onboardingComplete: boolean;
   platform: string;
@@ -54,6 +66,7 @@ export interface AppSnapshot {
 }
 
 export interface SetupStatus {
+  backendId: string;
   complete: boolean;
   serverFound: boolean;
   modelFound: boolean;

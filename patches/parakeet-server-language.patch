@@ -1,0 +1,25 @@
+diff --git a/examples/server/main.cpp b/examples/server/main.cpp
+index 0e4cbad..6a39771 100644
+--- a/examples/server/main.cpp
++++ b/examples/server/main.cpp
+@@ -139,6 +139,10 @@ int main(int argc, char** argv) {
+         for (const auto& g : req.get_file_values("timestamp_granularities[]"))
+             if (g.content == "word") include_words = true;
+ 
++        // parakeet.cpp uses this locale as the Nemotron language prompt. It is
++        // ignored by models without prompt conditioning.
++        const std::string language = req.has_file("language")
++            ? req.get_file_value("language").content : "";
+         const std::string& bytes = req.get_file_value("file").content;
+         std::vector<float> pcm;
+         int sr = 0;
+@@ -152,7 +156,8 @@ int main(int argc, char** argv) {
+             pk::Transcription tr;
+             {
+                 std::lock_guard<std::mutex> lock(infer_mu);
+-                tr = model->transcribe_with_timestamps(pcm, sr, pk::Decoder::kDefault);
++                tr = model->transcribe_with_timestamps(
++                    pcm, sr, pk::Decoder::kDefault, language);
+             }
+             Response out = format_transcription(tr, fmt, duration_sec, include_words);
+             res.set_content(out.body, out.content_type.c_str());

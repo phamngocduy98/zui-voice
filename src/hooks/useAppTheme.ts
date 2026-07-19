@@ -12,7 +12,7 @@ export function useAppTheme(themePreference: ThemePreference) {
       document.documentElement.dataset.theme = resolved;
       document.documentElement.style.colorScheme = resolved;
       if ("__TAURI_INTERNALS__" in window) {
-        void getCurrentWindow().setTheme(resolved).catch(() => undefined);
+        void getCurrentWindow().setTheme(themePreference === "system" ? null : resolved).catch(() => undefined);
       }
     };
     applyTheme();

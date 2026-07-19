@@ -6,6 +6,7 @@ import type { DownloadProgress, SetupStatus } from "../types";
 import { Onboarding } from "./Onboarding";
 
 const completeSetup: SetupStatus = {
+  backendId: "nemotron-3.5-asr-streaming-0.6b",
   complete: true,
   serverFound: true,
   modelFound: true,
@@ -20,16 +21,10 @@ afterEach(() => {
 });
 
 describe("Onboarding", () => {
-  it("requires microphone and engine verification before completion", async () => {
+  it("configures inputs and verifies the microphone and engine before completion", async () => {
     const snapshot = await api.getSnapshot();
-    let confirmShortcut: (() => void) | undefined;
     vi.spyOn(api, "listInputDevices").mockResolvedValue(["Studio Microphone"]);
-    vi.spyOn(api, "onHotkeyTest").mockImplementation(async (handler) => {
-      confirmShortcut = handler;
-      return () => undefined;
-    });
-    vi.spyOn(api, "getHotkeyTestStatus").mockResolvedValue(false);
-    const shortcut = vi.spyOn(api, "beginHotkeyTest").mockResolvedValue();
+    const update = vi.spyOn(api, "updateSettings");
     const microphone = vi.spyOn(api, "testMicrophone").mockResolvedValue();
     const engine = vi.spyOn(api, "retryBackend").mockResolvedValue(snapshot);
     const complete = vi.spyOn(api, "completeOnboarding").mockResolvedValue(snapshot);
@@ -38,30 +33,32 @@ describe("Onboarding", () => {
     render(
       <Onboarding
         setup={completeSetup}
+        snapshot={snapshot}
         platform="windows"
-        hotkeyLabel="Right Alt"
         inputDeviceName={null}
+        onChange={vi.fn()}
         onReady={onReady}
       />
     );
 
     expect(screen.getByRole("heading", { name: "Zui. Voice" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
-    expect(screen.getByRole("heading", { name: "Check your microphone" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Set up dictation" })).toBeTruthy();
     fireEvent.change(await screen.findByRole("combobox", { name: "Microphone" }), {
       target: { value: "Studio Microphone" }
     });
-    fireEvent.click(screen.getByRole("button", { name: "Test microphone" }));
-    expect((await screen.findByRole("status")).textContent).toContain("Microphone test passed");
-    expect(microphone).toHaveBeenCalledWith("Studio Microphone");
 
-    fireEvent.click(screen.getByRole("button", { name: "Test shortcut" }));
-    await act(async () => confirmShortcut?.());
-    expect(shortcut).toHaveBeenCalledOnce();
-    expect(screen.getByText("Right Alt is available system-wide")).toBeTruthy();
+    const keyRecorder = screen.getByRole("button", { name: /Hold key: Right Alt/ });
+    fireEvent.click(keyRecorder);
+    fireEvent.keyDown(keyRecorder, { key: "F9", code: "F9" });
+    await vi.waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      hotkey: expect.objectContaining({ key: "F9" })
+    })));
 
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled")).toBe(false));
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(await screen.findByRole("heading", { name: "Speak. Release. Done." })).toBeTruthy();
+    expect(microphone).toHaveBeenCalledWith("Studio Microphone");
     expect(engine).toHaveBeenCalledOnce();
 
     fireEvent.click(screen.getByRole("button", { name: "Start using Zui" }));
@@ -69,7 +66,33 @@ describe("Onboarding", () => {
     expect(complete).toHaveBeenCalledWith("Studio Microphone");
   });
 
+  it("lets users return to their model choice and moves focus with the stage", async () => {
+    const snapshot = await api.getSnapshot();
+    vi.spyOn(api, "listInputDevices").mockResolvedValue([]);
+
+    render(
+      <Onboarding
+        setup={completeSetup}
+        snapshot={snapshot}
+        platform="windows"
+        inputDeviceName={null}
+        onChange={vi.fn()}
+        onReady={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    const permissionsHeading = screen.getByRole("heading", { name: "Set up dictation" });
+    expect(document.activeElement).toBe(permissionsHeading);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    const installHeading = screen.getByRole("heading", { name: "Zui. Voice" });
+    expect(document.activeElement).toBe(installHeading);
+    expect(screen.getByRole("progressbar", { name: "Setup progress" }).getAttribute("aria-valuenow")).toBe("1");
+  });
+
   it("shows semantic progress for download and verification phases", async () => {
+    const snapshot = await api.getSnapshot();
     let publish: ((progress: DownloadProgress) => void) | undefined;
     vi.spyOn(api, "onDownload").mockImplementation(async (handler) => {
       publish = handler;
@@ -80,9 +103,10 @@ describe("Onboarding", () => {
     render(
       <Onboarding
         setup={{ ...completeSetup, complete: false, modelFound: false }}
+        snapshot={snapshot}
         platform="windows"
-        hotkeyLabel="Right Alt"
         inputDeviceName={null}
+        onChange={vi.fn()}
         onReady={vi.fn()}
       />
     );
@@ -90,26 +114,28 @@ describe("Onboarding", () => {
     await act(async () => {
       publish?.({
         phase: "verifying",
-        asset: "vietnamese-model",
+        asset: "nemotron-model",
         received: 917_504_000,
         total: 917_504_000,
         percent: 100
       });
     });
 
-    const progress = screen.getByRole("progressbar", { name: "Verifying checksum Vietnamese model" });
+    const progress = screen.getByRole("progressbar", { name: "Verifying checksum Speech model" });
     expect(progress.getAttribute("aria-valuenow")).toBe("100");
     expect(screen.getByRole("button", { name: "Cancel download" })).toBeTruthy();
   });
 
   it("downloads from the release when setup is incomplete", async () => {
+    const snapshot = await api.getSnapshot();
     const download = vi.spyOn(api, "startAssetDownload").mockResolvedValue(completeSetup);
     render(
       <Onboarding
         setup={{ ...completeSetup, complete: false, modelFound: false, manifestConfigured: false }}
+        snapshot={snapshot}
         platform="linux"
-        hotkeyLabel="Right Alt"
         inputDeviceName={null}
+        onChange={vi.fn()}
         onReady={vi.fn()}
       />
     );

@@ -6,7 +6,7 @@ const sections: Array<{ id: SettingsSection; label: string; search: string; icon
   { id: "audio", label: "Audio", search: "audio microphone", icon: Headphones },
   { id: "engine", label: "Local Engine", search: "local engine model", icon: Gauge },
   { id: "appearance", label: "Appearance", search: "appearance theme light dark system", icon: SunMoon },
-  { id: "legal", label: "Legal & Privacy", search: "legal privacy license notices model parakeet", icon: Info }
+  { id: "legal", label: "Legal & Privacy", search: "legal privacy license notices model nemotron parakeet runtime", icon: Info }
 ];
 
 export function SettingsSidebar({ activeSection, onSectionChange, searchQuery, onSearchChange }: {
@@ -28,7 +28,7 @@ export function SettingsSidebar({ activeSection, onSectionChange, searchQuery, o
       <p className="sidebar-label">Zui Voice</p>
       <nav className="settings-nav" aria-label="Settings sections">
         {visibleSections.map(({ id, label, icon: Icon }) => (
-          <button type="button" className={activeSection === id ? "active" : ""} onClick={() => onSectionChange(id)} key={id}>
+          <button type="button" aria-label={label} className={activeSection === id ? "active" : ""} onClick={() => onSectionChange(id)} key={id}>
             <span className={`nav-icon ${id}`}><Icon /></span>
             <strong>{label}</strong>
           </button>

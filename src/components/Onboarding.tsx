@@ -1,33 +1,32 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronLeft,
   ChevronRight,
+  ClipboardCheck,
   Cpu,
   Download,
   Keyboard,
   LoaderCircle,
   Mic2,
-  ShieldCheck,
   Sparkles,
   X
 } from "lucide-react";
 import {
-  beginHotkeyTest,
   cancelAssetDownload,
-  cancelHotkeyTest,
   completeOnboarding,
-  getHotkeyTestStatus,
+  getSetupStatus,
   listInputDevices,
   onDownload,
-  onHotkeyTest,
   retryBackend,
   startAssetDownload,
-  testMicrophone
+  testMicrophone,
+  updateSettings
 } from "../api";
-import type { DownloadProgress, SetupStatus } from "../types";
+import type { AppSettings, AppSnapshot, DownloadProgress, SetupStatus } from "../types";
 import type { UiPlatform } from "../ui";
-import { errorMessage } from "../ui";
+import { errorMessage, formatHotkeyLabel } from "../ui";
+import { KeyRecorder, type KeyRecorderState } from "./KeyRecorder";
 
 type Stage = "install" | "permissions" | "verifying" | "tutorial";
 
@@ -48,7 +47,7 @@ const phaseCopy: Record<DownloadProgress["phase"], string> = {
 function assetLabel(asset: string) {
   const value = asset.toLowerCase();
   if (value.includes("manifest")) return "Setup information";
-  if (value.includes("model")) return "Vietnamese model";
+  if (value.includes("model")) return "Speech model";
   if (value.includes("runtime") || value.includes("server")) return "Speech engine";
   return "Required component";
 }
@@ -62,70 +61,73 @@ function isCancelled(error: unknown) {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "download_cancelled");
 }
 
-export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onReady }: {
+export function Onboarding({ setup, snapshot, platform, inputDeviceName, onChange, onReady }: {
   setup: SetupStatus;
+  snapshot: AppSnapshot;
   platform: UiPlatform;
-  hotkeyLabel: string;
   inputDeviceName: string | null;
+  onChange: (value: AppSnapshot) => void;
   onReady: () => void;
 }) {
+  const onboardingRef = useRef<HTMLElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const initialStage = useRef(true);
   const [stage, setStage] = useState<Stage>("install");
   const [setupState, setSetupState] = useState(setup);
+  const [selection, setSelection] = useState(snapshot.settings);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [devices, setDevices] = useState<string[]>([]);
   const [selectedDevice, setSelectedDevice] = useState(inputDeviceName);
-  const [microphoneReady, setMicrophoneReady] = useState(false);
-  const [shortcutReady, setShortcutReady] = useState(false);
-  const [shortcutWaiting, setShortcutWaiting] = useState(false);
+  const [keyRecorderState, setKeyRecorderState] = useState<KeyRecorderState>("idle");
   const [working, setWorking] = useState(false);
+  const [selectionWorking, setSelectionWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const selectedBackend = snapshot.backends.find((backend) => backend.id === selection.backendId)
+    ?? snapshot.backends[0];
+  const configuredHotkeyLabel = formatHotkeyLabel(selection.hotkey.key, platform);
+
+  const goToStage = (nextStage: Stage) => {
+    setError(null);
+    setStage(nextStage);
+  };
+
+  useEffect(() => {
+    if (initialStage.current) {
+      initialStage.current = false;
+      return;
+    }
+    onboardingRef.current?.scrollTo?.({ top: 0 });
+    headingRef.current?.focus({ preventScroll: true });
+  }, [stage]);
+
+  const saveSelection = async (next: AppSettings) => {
+    setSelectionWorking(true);
+    setError(null);
+    try {
+      const nextSnapshot = await updateSettings(next);
+      setSelection(nextSnapshot.settings);
+      onChange(nextSnapshot);
+      setSetupState(await getSetupStatus());
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setSelectionWorking(false);
+    }
+  };
+
+  const chooseBackend = (backendId: string) => {
+    const backend = snapshot.backends.find((item) => item.id === backendId);
+    if (!backend) return;
+    const locale = backend.locales.some((item) => item.locale === selection.locale)
+      ? selection.locale
+      : backend.locales[0]?.locale ?? "vi-VN";
+    void saveSelection({ ...selection, backendId, locale });
+  };
 
   useEffect(() => {
     let disposed = false;
     let unlisten: () => void = () => undefined;
     onDownload(setProgress).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
-    }).catch(() => undefined);
-    return () => {
-      disposed = true;
-      unlisten();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!shortcutWaiting) return;
-    let disposed = false;
-    const check = async () => {
-      try {
-        if (await getHotkeyTestStatus() && !disposed) {
-          setShortcutReady(true);
-          setShortcutWaiting(false);
-          setError(null);
-        }
-      } catch (caught) {
-        if (!disposed) {
-          setShortcutWaiting(false);
-          setError(errorMessage(caught));
-        }
-      }
-    };
-    void check();
-    const timer = window.setInterval(check, 200);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, [shortcutWaiting]);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: () => void = () => undefined;
-    onHotkeyTest(() => {
-      setShortcutReady(true);
-      setShortcutWaiting(false);
-      setError(null);
-    }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;
     }).catch(() => undefined);
@@ -156,7 +158,7 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
     try {
       const result = await startAssetDownload();
       setSetupState(result);
-      if (result.complete) setStage("permissions");
+      if (result.complete) goToStage("permissions");
       else setError("The download finished, but a required component is still missing.");
     } catch (caught) {
       setProgress(null);
@@ -175,13 +177,14 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
     }
   };
 
-  const checkMicrophone = async () => {
+  const verifySetup = async () => {
     setWorking(true);
-    setMicrophoneReady(false);
     setError(null);
     try {
       await testMicrophone(selectedDevice);
-      setMicrophoneReady(true);
+      goToStage("verifying");
+      await retryBackend();
+      goToStage("tutorial");
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -189,34 +192,12 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
     }
   };
 
-  const checkShortcut = async () => {
-    if (shortcutWaiting) {
-      try {
-        await cancelHotkeyTest();
-      } catch (caught) {
-        setError(errorMessage(caught));
-      } finally {
-        setShortcutWaiting(false);
-      }
-      return;
-    }
-    setShortcutReady(false);
-    setError(null);
-    try {
-      await beginHotkeyTest();
-      setShortcutWaiting(true);
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
-  };
-
   const verifyEngine = async () => {
-    setStage("verifying");
     setWorking(true);
     setError(null);
     try {
       await retryBackend();
-      setStage("tutorial");
+      goToStage("tutorial");
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -243,20 +224,39 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
     : platform === "macos"
       ? "macOS may request Microphone and Input Monitoring access. Transcripts are copied for you to paste manually."
       : "Transcripts are copied for manual paste because reliable foreground-app validation is not available on this platform.";
+  const keyRecorderDetail = keyRecorderState === "invalid"
+    ? "Use Right Alt, Right Control, F8, or F9"
+    : keyRecorderState === "listening"
+      ? "Press a key now; Escape cancels"
+      : "Press and hold this key while speaking";
 
   return (
-    <main className="onboarding">
+    <main className="onboarding" ref={onboardingRef}>
       <div className="onboarding-content">
-        <div className="onboarding-stage" aria-label={`Setup step ${currentStage} of 4`}>
-          {[1, 2, 3, 4].map((number) => <i className={number <= currentStage ? "active" : ""} key={number} />)}
+        <div className="onboarding-stage" role="progressbar" aria-label="Setup progress" aria-valuemin={1} aria-valuemax={4} aria-valuenow={currentStage} aria-valuetext={`Step ${currentStage} of 4`}>
+          {[1, 2, 3, 4].map((number) => <i className={number <= currentStage ? "active" : ""} aria-hidden="true" key={number} />)}
         </div>
 
         {stage === "install" && (
           <>
             <div className="brand-mark"><Sparkles size={22} /></div>
             <p className="eyebrow">WELCOME TO</p>
-            <h1>Zui. <em>Voice</em></h1>
-            <p className="lede">Private Vietnamese dictation that stays on your computer.</p>
+            <h1 ref={headingRef} tabIndex={-1}>Zui. <em>Voice</em></h1>
+            <p className="lede">Private, local dictation with a model and language you choose.</p>
+            <div className="onboarding-choices">
+              <label>
+                <span>Speech model</span>
+                <select aria-label="Speech model" value={selection.backendId} disabled={working || selectionWorking} onChange={(event) => chooseBackend(event.target.value)}>
+                  {snapshot.backends.map((backend) => <option value={backend.id} key={backend.id}>{backend.name} · {backend.language}</option>)}
+                </select>
+              </label>
+              <label>
+                <span>Transcription language</span>
+                <select aria-label="Transcription language" value={selection.locale} disabled={working || selectionWorking} onChange={(event) => void saveSelection({ ...selection, locale: event.target.value })}>
+                  {selectedBackend?.locales.map((locale) => <option value={locale.locale} key={locale.locale}>{locale.name}</option>)}
+                </select>
+              </label>
+            </div>
             <div className="setup-card">
               <div className={setupState.serverFound ? "step complete" : "step"}>
                 <span>{setupState.serverFound ? <Check /> : "1"}</span>
@@ -264,7 +264,7 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
               </div>
               <div className={setupState.modelFound ? "step complete" : "step"}>
                 <span>{setupState.modelFound ? <Check /> : "2"}</span>
-                <div><strong>Vietnamese model</strong><small>About 875 MB, downloaded once</small></div>
+                <div><strong>{selectedBackend?.name ?? "Speech model"}</strong><small>Downloaded once for private, offline use</small></div>
               </div>
               <div className={setupState.complete ? "step complete" : "step"}>
                 <span>{setupState.complete ? <Check /> : "3"}</span>
@@ -295,7 +295,8 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
               <button
                 type="button"
                 className="primary"
-                onClick={working ? cancel : setupState.complete ? () => setStage("permissions") : download}
+                disabled={selectionWorking}
+                onClick={working ? cancel : setupState.complete ? () => goToStage("permissions") : download}
               >
                 {working
                   ? <><X size={17} /> Cancel download</>
@@ -312,50 +313,55 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
           <>
             <div className="stage-icon"><Mic2 /></div>
             <p className="eyebrow">STEP 2 OF 4</p>
-            <h1>Check your microphone</h1>
-            <p className="lede">Zui needs a working input stream. The test is discarded immediately and is never transcribed.</p>
+            <h1 ref={headingRef} tabIndex={-1}>Set up dictation</h1>
+            <p className="lede">Choose the microphone and hold key you want to use for dictation.</p>
             <div className="setup-card permission-card">
-              <div className={microphoneReady ? "step complete" : "step"}>
-                <span>{microphoneReady ? <Check /> : <Mic2 />}</span>
+              <div className="step">
+                <span><Mic2 /></span>
                 <div className="permission-copy">
-                  <strong>Microphone access</strong>
-                  <small>{microphoneReady ? "Audio input is available" : "Your system may ask for permission"}</small>
-                  <select
-                    aria-label="Microphone"
-                    value={selectedDevice ?? ""}
-                    onChange={(event) => {
-                      setSelectedDevice(event.target.value || null);
-                      setMicrophoneReady(false);
-                    }}
-                  >
-                    <option value="">System default</option>
-                    {devices.map((device) => <option value={device} key={device}>{device}</option>)}
-                  </select>
-                </div>
-              </div>
-              <div className={shortcutReady ? "step complete" : "step"}>
-                <span>{shortcutReady ? <Check /> : <Keyboard />}</span>
-                <div className="permission-copy">
-                  <strong>Global hold key</strong>
-                  <small>{shortcutReady ? `${hotkeyLabel} is available system-wide` : shortcutWaiting ? `Press ${hotkeyLabel} now` : "Optional check; system access can also be configured later"}</small>
-                  <button type="button" className="inline-test-button" onClick={checkShortcut}>
-                    {shortcutWaiting ? "Cancel test" : shortcutReady ? "Test again" : "Test shortcut"}
-                  </button>
+                  <strong>Microphone</strong>
+                  <small>Audio input for dictation</small>
+                  <div className="permission-control-row">
+                    <select
+                      aria-label="Microphone"
+                      value={selectedDevice ?? ""}
+                      disabled={working || selectionWorking}
+                      onChange={(event) => setSelectedDevice(event.target.value || null)}
+                    >
+                      <option value="">System default</option>
+                      {devices.map((device) => <option value={device} key={device}>{device}</option>)}
+                    </select>
+                  </div>
                 </div>
               </div>
               <div className="step">
-                <span><ShieldCheck /></span>
-                <div><strong>{platform === "windows" ? "Automatic insertion" : "Safe clipboard delivery"}</strong><small>{platformDetail}</small></div>
+                <span><Keyboard /></span>
+                <div className="permission-copy">
+                  <strong>Hold key</strong>
+                  <small>{keyRecorderDetail}</small>
+                  <div className="permission-control-row">
+                    <KeyRecorder
+                      value={selection.hotkey.key}
+                      platform={platform}
+                      disabled={selectionWorking || working}
+                      onChange={(key) => void saveSelection({ ...selection, hotkey: { ...selection.hotkey, key } })}
+                      onStateChange={setKeyRecorderState}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
+            <div className="delivery-note">
+              <ClipboardCheck />
+              <div><strong>{platform === "windows" ? "Automatic insertion" : "Safe clipboard delivery"}</strong><small>{platformDetail}</small></div>
+            </div>
             {error && <p className="inline-error" role="alert">{error}</p>}
-            {microphoneReady && <p className="inline-success" role="status"><Check /> Microphone test passed</p>}
             <div className="onboarding-actions">
-              <button type="button" className="secondary-button" onClick={checkMicrophone} disabled={working}>
-                {working ? <><LoaderCircle className="spin" /> Testing…</> : <><Mic2 /> Test microphone</>}
+              <button type="button" className="secondary-button" onClick={() => goToStage("install")} disabled={working || selectionWorking}>
+                <ChevronLeft /> Back
               </button>
-              <button type="button" className="primary" onClick={verifyEngine} disabled={!microphoneReady || working}>
-                Continue <ChevronRight size={17} />
+              <button type="button" className="primary" onClick={verifySetup} disabled={working || selectionWorking || keyRecorderState !== "idle"}>
+                {working ? <><LoaderCircle className="spin" /> Checking microphone…</> : <>Continue <ChevronRight size={17} /></>}
               </button>
             </div>
           </>
@@ -365,19 +371,18 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
           <>
             <div className="stage-icon"><Cpu /></div>
             <p className="eyebrow">STEP 3 OF 4</p>
-            <h1>Verify the local engine</h1>
-            <p className="lede">Zui is starting Parakeet and loading the Vietnamese model. The first load can take a moment.</p>
-            <div className="engine-check" role="status" aria-live="polite">
+            <h1 ref={headingRef} tabIndex={-1}>Verify the local engine</h1>
+            <p className="lede">Zui is starting the local engine and loading {selectedBackend?.name ?? "the selected model"}. The first load can take a moment.</p>
+            <div className="engine-check" role={error ? "alert" : "status"} aria-live="polite">
               {working ? <LoaderCircle className="spin" /> : error ? <X /> : <Check />}
               <div>
                 <strong>{working ? "Loading the model…" : error ? "Couldn’t start the engine" : "Engine ready"}</strong>
                 <small>{working ? "Everything remains on this computer" : error ?? "Local health check passed"}</small>
               </div>
             </div>
-            {error && <p className="inline-error" role="alert">{error}</p>}
             <div className="onboarding-actions">
               {!working && (
-                <button type="button" className="secondary-button" onClick={() => setStage("permissions")}>
+                <button type="button" className="secondary-button" onClick={() => goToStage("permissions")}>
                   <ChevronLeft /> Back
                 </button>
               )}
@@ -392,16 +397,16 @@ export function Onboarding({ setup, platform, hotkeyLabel, inputDeviceName, onRe
           <>
             <div className="stage-icon success"><Check /></div>
             <p className="eyebrow">READY TO DICTATE</p>
-            <h1>Speak. Release. Done.</h1>
+            <h1 ref={headingRef} tabIndex={-1}>Speak. Release. Done.</h1>
             <p className="lede">The model and microphone are ready. Here’s all you need to remember.</p>
             <ol className="tutorial-steps">
-              <li><span>1</span><div><strong>Hold <kbd>{hotkeyLabel}</kbd></strong><small>Keep holding while you speak Vietnamese.</small></div></li>
+              <li><span>1</span><div><strong>Hold <kbd>{configuredHotkeyLabel}</kbd></strong><small>Keep holding while you speak {selectedBackend?.locales.find((locale) => locale.locale === selection.locale)?.name ?? "your selected language"}.</small></div></li>
               <li><span>2</span><div><strong>Release when finished</strong><small>Zui transcribes locally and clears the temporary recording.</small></div></li>
               <li><span>3</span><div><strong>{platform === "windows" ? "Continue typing" : "Paste the copied text"}</strong><small>{platform === "windows" ? "Text is inserted if the original app is still focused." : "Use your usual paste shortcut in the destination app."}</small></div></li>
             </ol>
             {error && <p className="inline-error" role="alert">{error}</p>}
             <div className="onboarding-actions">
-              <button type="button" className="secondary-button" onClick={() => setStage("permissions")} disabled={working}>
+              <button type="button" className="secondary-button" onClick={() => goToStage("permissions")} disabled={working}>
                 <ChevronLeft /> Back
               </button>
               <button type="button" className="primary" onClick={finish} disabled={working}>

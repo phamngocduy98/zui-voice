@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { listInputDevices, retryBackend, unloadModel, updateSettings } from "../api";
+import { getSnapshot, listInputDevices, retryBackend, startAssetDownload, unloadModel, updateSettings } from "../api";
 import type { AppSettings, AppSnapshot, ThemePreference } from "../types";
 import type { UiPlatform } from "../ui";
 import { errorMessage } from "../ui";
@@ -26,6 +26,7 @@ export function Settings({ snapshot, onChange, onThemePreview, platform, hotkeyL
   const [searchQuery, setSearchQuery] = useState("");
   const [unloading, setUnloading] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
   const [engineError, setEngineError] = useState<string | null>(null);
   const saveTimer = useRef<number | null>(null);
   const revision = useRef(0);
@@ -58,6 +59,20 @@ export function Settings({ snapshot, onChange, onThemePreview, platform, hotkeyL
   };
 
   const patch = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => commit({ ...draft, [key]: value });
+  const install = async () => {
+    setInstalling(true);
+    setEngineError(null);
+    try {
+      await startAssetDownload();
+      const nextSnapshot = await getSnapshot();
+      onChange(nextSnapshot);
+      setDraft(nextSnapshot.settings);
+    } catch (caught) {
+      setEngineError(errorMessage(caught));
+    } finally {
+      setInstalling(false);
+    }
+  };
   const setTheme = (theme: ThemePreference) => {
     onThemePreview(theme);
     patch("theme", theme);
@@ -117,8 +132,11 @@ export function Settings({ snapshot, onChange, onThemePreview, platform, hotkeyL
                 <DictationSettings
                   settings={draft}
                   hotkeyLabel={hotkeyLabel}
+                  platform={platform}
                   onEnabledChange={(value) => patch("enabled", value)}
+                  onHotkeyChange={(key) => commit({ ...draft, hotkey: { ...draft.hotkey, key } })}
                   onConsumeChange={(consume) => commit({ ...draft, hotkey: { ...draft.hotkey, consume } })}
+                  onRecordingLimitChange={(value) => patch("maxRecordingSeconds", value)}
                   onClipboardRestoreChange={(value) => patch("clipboardRestore", value)}
                   onLaunchAtLoginChange={(value) => patch("launchAtLogin", value)}
                 />
@@ -128,16 +146,19 @@ export function Settings({ snapshot, onChange, onThemePreview, platform, hotkeyL
                   settings={draft}
                   devices={devices}
                   onInputDeviceChange={(value) => patch("inputDeviceName", value)}
-                  onRecordingLimitChange={(value) => patch("maxRecordingSeconds", value)}
                 />
               )}
               {activeSection === "engine" && (
                 <EngineSettings
                   settings={draft}
+                  backends={snapshot.backends}
                   status={backendStatus}
                   unloading={unloading}
+                  installing={installing}
                   checking={checking}
                   error={engineError}
+                  onLocaleChange={(value) => patch("locale", value)}
+                  onInstall={install}
                   onUnload={unload}
                   onRetry={retry}
                   onIdleTimeoutChange={(value) => patch("modelIdleTimeoutSeconds", value)}

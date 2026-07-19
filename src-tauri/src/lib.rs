@@ -4,6 +4,7 @@ mod backend;
 mod cancellation;
 mod clipboard;
 mod hotkey;
+mod models;
 mod platform;
 mod runtime;
 mod settings;
@@ -120,21 +121,29 @@ fn get_hotkey_test_status(runtime: State<'_, RuntimeState>) -> AppResult<bool> {
 }
 
 #[tauri::command]
+fn confirm_hotkey_test(runtime: State<'_, RuntimeState>) -> AppResult<bool> {
+    Ok(runtime.require()?.confirm_hotkey_test())
+}
+
+#[tauri::command]
 fn cancel_hotkey_test(runtime: State<'_, RuntimeState>) -> AppResult<()> {
     runtime.require()?.cancel_hotkey_test();
     Ok(())
 }
 
 #[tauri::command]
-fn complete_onboarding(
+async fn complete_onboarding(
     runtime: State<'_, RuntimeState>,
     input_device_name: Option<String>,
 ) -> AppResult<AppSnapshot> {
-    runtime.require()?.complete_onboarding(input_device_name)
+    runtime
+        .require()?
+        .complete_onboarding(input_device_name)
+        .await
 }
 
 #[tauri::command]
-fn update_settings(
+async fn update_settings(
     app: AppHandle,
     runtime: State<'_, RuntimeState>,
     settings: AppSettings,
@@ -153,7 +162,7 @@ fn update_settings(
     if launch_at_login_changed {
         set_autostart(&app, settings.launch_at_login)?;
     }
-    match runtime.update_settings(settings) {
+    match runtime.update_settings(settings).await {
         Ok(snapshot) => Ok(snapshot),
         Err(error) => {
             if launch_at_login_changed {
@@ -179,7 +188,8 @@ fn set_autostart(app: &AppHandle, enabled: bool) -> AppResult<()> {
 #[tauri::command]
 async fn download_assets(runtime: State<'_, RuntimeState>) -> AppResult<SetupStatus> {
     let runtime = runtime.require()?;
-    let status = runtime.assets.download().await?;
+    let backend_id = runtime.settings.get().backend_id;
+    let status = runtime.assets.download(&backend_id).await?;
     runtime.set_state(crate::types::DictationState::Idle {
         backend_status: crate::types::BackendStatus::Stopped,
     });
@@ -230,7 +240,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open, &toggle, &unload, &quit])?;
     TrayIconBuilder::with_id("zui-tray")
         .icon(tray_image())
-        .tooltip("Zui. Voice — hold Right Alt to dictate")
+        .tooltip("Zui. Voice - hold your configured key to dictate")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_settings(app),
@@ -241,10 +251,9 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 };
                 let mut settings = runtime.settings.get();
                 settings.enabled = !settings.enabled;
-                if !settings.enabled {
-                    runtime.cancel();
-                }
-                let _ = runtime.update_settings(settings);
+                tauri::async_runtime::spawn(async move {
+                    let _ = runtime.update_settings(settings).await;
+                });
             }
             "unload" => {
                 let state = app.state::<RuntimeState>();
@@ -322,8 +331,8 @@ pub fn run() {
                 .spawn(move || {
                     while let Ok(event) = hotkey_receiver.recv() {
                         match event {
-                            HotkeyEvent::Pressed => control_runtime.press(),
-                            HotkeyEvent::Released => control_runtime.release(),
+                            HotkeyEvent::Pressed(_) => control_runtime.press(),
+                            HotkeyEvent::Released(_) => control_runtime.release(),
                             HotkeyEvent::Cancel => control_runtime.cancel(),
                         }
                     }
@@ -332,10 +341,25 @@ pub fn run() {
 
             let callback_runtime = runtime.clone();
             service.start(Arc::new(move |event| {
-                let _ = hotkey_sender.send(event);
                 let settings = callback_runtime.settings.get();
-                settings.enabled
-                    && callback_runtime.assets.status().complete
+                let selected = match event {
+                    HotkeyEvent::Pressed(key) | HotkeyEvent::Released(key) => {
+                        key.id() == settings.hotkey.key
+                    }
+                    HotkeyEvent::Cancel => true,
+                };
+                let confirmed_test = selected
+                    && matches!(event, HotkeyEvent::Pressed(_))
+                    && callback_runtime.confirm_hotkey_test();
+                if selected && !confirmed_test {
+                    let _ = hotkey_sender.send(event);
+                }
+                selected
+                    && settings.enabled
+                    && callback_runtime
+                        .assets
+                        .status(&settings.backend_id)
+                        .complete
                     && settings.hotkey.consume
             }))?;
             runtime.start_idle_supervisor();
@@ -356,6 +380,7 @@ pub fn run() {
             test_microphone,
             begin_hotkey_test,
             get_hotkey_test_status,
+            confirm_hotkey_test,
             cancel_hotkey_test,
             complete_onboarding,
             update_settings,

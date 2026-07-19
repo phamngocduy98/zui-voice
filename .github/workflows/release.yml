@@ -18,8 +18,61 @@ jobs:
           node-version: 20
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+          $packageVersion = (Get-Content -LiteralPath "package.json" -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content -LiteralPath "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -LiteralPath "src-tauri/Cargo.toml" -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
+          if (@($packageVersion, $tauriVersion, $cargoVersion) | Where-Object { $_ -ne $tagVersion }) {
+            throw "Release tag $tagVersion does not match package ($packageVersion), Tauri ($tauriVersion), and Cargo ($cargoVersion) versions."
+          }
       - run: npm ci
       - run: npm test
+      - name: Build patched parakeet.cpp runtime
+        shell: pwsh
+        run: ./scripts/build-parakeet-runtime.ps1
+      - name: Download and verify Nemotron model
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -LiteralPath "src-tauri/assets/release-manifest.json" -Raw | ConvertFrom-Json
+          $model = $manifest.assets | Where-Object kind -eq "model"
+          $destination = "bin/$($model.filename)"
+          $source = "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/bf0af9f425fa01809cadec671b3cb672709d13e9/$($model.filename)"
+          curl.exe --location --fail --retry 3 --output $destination $source
+          if ($LASTEXITCODE -ne 0) { throw "Model download failed with exit code $LASTEXITCODE." }
+          $file = Get-Item -LiteralPath $destination
+          $sha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($file.Length -ne $model.size -or $sha256 -ne $model.sha256) {
+            throw "Downloaded model does not match the release manifest."
+          }
+      - name: Prepare release manifest
+        shell: pwsh
+        run: |
+          $path = "src-tauri/assets/release-manifest.json"
+          $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+          $runtime = $manifest.assets | Where-Object kind -eq "runtime"
+          $model = $manifest.assets | Where-Object kind -eq "model"
+          $binary = Get-Item -LiteralPath "bin/parakeet-server.exe"
+          $runtime.size = $binary.Length
+          $runtime.sha256 = (Get-FileHash -LiteralPath $binary.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $runtime.url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/parakeet-server.exe"
+          $model.url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$($model.filename)"
+          $manifest.release = "${{ github.ref_name }}".TrimStart("v")
+          $manifest.engineVersion = "0.4.0-zui.1"
+          $manifest.licenseNoticeUrl = "https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/THIRD_PARTY_NOTICES.md"
+          $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $path
+      - name: Upload speech runtime and manifest
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            bin/parakeet-server.exe
+            bin/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf
+            src-tauri/assets/release-manifest.json
+            THIRD_PARTY_NOTICES.md
+            licenses/OpenMDW-1.1.txt
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -29,7 +82,7 @@ jobs:
           releaseBody: |
             Windows x64 release of Zui. Voice.
 
-            On first launch, the app downloads the versioned speech engine and Vietnamese model from this release and verifies their SHA-256 checksums before installation.
+            On first launch, the app downloads the versioned speech engine and Nemotron multilingual model, then verifies SHA-256 checksums before installation.
           releaseDraft: true
           prerelease: false
           args: --bundles nsis

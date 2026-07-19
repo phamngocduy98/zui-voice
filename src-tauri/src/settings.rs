@@ -1,4 +1,7 @@
-use crate::types::{AppError, AppResult, AppSettings, CURRENT_ONBOARDING_VERSION};
+use crate::{
+    models,
+    types::{AppError, AppResult, AppSettings, CURRENT_ONBOARDING_VERSION},
+};
 use std::{
     fs,
     io::Write,
@@ -7,6 +10,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
+
+const LEGACY_PARAKEET_BACKEND_ID: &str = "parakeet-vietnamese";
 
 pub struct SettingsStore {
     path: PathBuf,
@@ -55,13 +60,24 @@ fn load_settings(path: &Path) -> AppResult<AppSettings> {
     };
     let parsed = serde_json::from_str::<AppSettings>(&text)
         .map_err(|error| error.to_string())
-        .and_then(|settings| {
+        .and_then(|mut settings| {
+            let migrated = settings.backend_id == LEGACY_PARAKEET_BACKEND_ID;
+            if migrated {
+                settings.backend_id = models::NEMOTRON_ID.into();
+            }
             validate_settings(&settings)
-                .map(|()| settings)
+                .map(|()| (settings, migrated))
                 .map_err(|error| error.message)
         });
     match parsed {
-        Ok(settings) => Ok(settings),
+        Ok((settings, migrated)) => {
+            if migrated {
+                let json = serde_json::to_vec_pretty(&settings)
+                    .map_err(|e| AppError::new("settings_serialize", e.to_string()))?;
+                write_atomically(path, &json)?;
+            }
+            Ok(settings)
+        }
         Err(error) => {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -103,16 +119,22 @@ pub fn validate_settings(settings: &AppSettings) -> AppResult<()> {
             "The onboarding version is newer than this application supports.",
         ));
     }
-    if settings.hotkey.key != "RightAlt" {
+    if !crate::hotkey::is_supported_hold_key(&settings.hotkey.key) {
         return Err(AppError::new(
             "unsupported_hotkey",
-            "This version supports Right Alt as the hold key.",
+            "Choose Right Alt, Right Control, F8, or F9 as the hold key.",
         ));
     }
-    if settings.backend_id != "parakeet-vietnamese" {
-        return Err(AppError::new(
+    let backend = models::backend(&settings.backend_id).ok_or_else(|| {
+        AppError::new(
             "unsupported_backend",
             "The selected transcription backend is not supported.",
+        )
+    })?;
+    if !backend.supports_locale(&settings.locale) {
+        return Err(AppError::new(
+            "unsupported_locale",
+            "The selected language is not supported by this transcription model.",
         ));
     }
     if settings
@@ -150,6 +172,27 @@ mod tests {
     }
 
     #[test]
+    fn accepts_supported_hold_keys() {
+        for key in ["RightAlt", "RightControl", "F8", "F9"] {
+            let mut settings = AppSettings::default();
+            settings.hotkey.key = key.into();
+            assert!(validate_settings(&settings).is_ok(), "{key}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_hold_keys() {
+        let mut settings = AppSettings::default();
+        settings.hotkey.key = "Space".into();
+        assert_eq!(
+            validate_settings(&settings)
+                .expect_err("unsupported hold key")
+                .code,
+            "unsupported_hotkey"
+        );
+    }
+
+    #[test]
     fn rejects_recordings_longer_than_five_minutes() {
         let settings = AppSettings {
             max_recording_seconds: 301,
@@ -164,8 +207,53 @@ mod tests {
         assert!(!settings.enabled);
         assert_eq!(settings.max_recording_seconds, 300);
         assert_eq!(settings.model_idle_timeout_seconds, 600);
+        assert_eq!(settings.backend_id, models::NEMOTRON_ID);
+        assert_eq!(settings.locale, "vi-VN");
         assert_eq!(settings.theme, crate::types::ThemePreference::System);
         assert_eq!(settings.onboarding_version, 0);
+    }
+
+    #[test]
+    fn accepts_nemotron_production_locales() {
+        let settings = AppSettings {
+            backend_id: models::NEMOTRON_ID.into(),
+            locale: "en-US".into(),
+            ..AppSettings::default()
+        };
+        assert!(validate_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_locale_not_supported_by_nemotron() {
+        let settings = AppSettings {
+            locale: "th-TH".into(),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            validate_settings(&settings)
+                .expect_err("locale is not in the Nemotron production catalog")
+                .code,
+            "unsupported_locale"
+        );
+    }
+
+    #[test]
+    fn migrates_removed_parakeet_backend_to_nemotron() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"backendId":"parakeet-vietnamese","locale":"vi-VN"}"#,
+        )
+        .expect("seed legacy settings");
+
+        let settings = load_settings(&path).expect("migrate legacy settings");
+
+        assert_eq!(settings.backend_id, models::NEMOTRON_ID);
+        let persisted: AppSettings =
+            serde_json::from_str(&fs::read_to_string(path).expect("read migrated settings"))
+                .expect("parse migrated settings");
+        assert_eq!(persisted.backend_id, models::NEMOTRON_ID);
     }
 
     #[test]

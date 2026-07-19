@@ -3,9 +3,10 @@ use crate::{
     audio::AudioRecorder,
     backend::{ParakeetBackend, TranscriptionBackend, TranscriptionRequest},
     clipboard::{ClipboardService, Delivery},
+    models,
     platform::{
         capture_foreground, hide_overlay, is_wayland, platform_name, position_and_show_overlay,
-        ForegroundTarget,
+        prepare_overlay_error, ForegroundTarget,
     },
     settings::SettingsStore,
     types::{
@@ -27,11 +28,12 @@ pub struct AppRuntime {
     app: AppHandle,
     pub settings: SettingsStore,
     pub assets: Arc<AssetManager>,
-    pub backend: Arc<dyn TranscriptionBackend>,
+    pub backend: Arc<ParakeetBackend>,
     recorder: AudioRecorder,
     clipboard: ClipboardService,
     state: RwLock<DictationState>,
     transition: Mutex<()>,
+    settings_update: tokio::sync::Mutex<()>,
     activation: ActivationGate,
     model_unloading: AtomicBool,
     microphone_verified: AtomicBool,
@@ -113,14 +115,15 @@ impl AppRuntime {
     pub fn new(app: &AppHandle) -> AppResult<Arc<Self>> {
         let settings = SettingsStore::load(app)?;
         let assets = Arc::new(AssetManager::new(app)?);
-        let backend: Arc<dyn TranscriptionBackend> = Arc::new(ParakeetBackend::new(assets.clone()));
-        let initial = if assets.status().complete {
+        let selected_backend_id = settings.get().backend_id;
+        let backend = Arc::new(ParakeetBackend::new(assets.clone(), &selected_backend_id));
+        let initial = if assets.status(&selected_backend_id).complete {
             DictationState::Idle {
                 backend_status: BackendStatus::Stopped,
             }
         } else {
             DictationState::SetupRequired {
-                detail: "Download the Vietnamese model and native runtime.".into(),
+                detail: "Download the selected model and native runtime.".into(),
             }
         };
         Ok(Arc::new(Self {
@@ -132,6 +135,7 @@ impl AppRuntime {
             clipboard: ClipboardService::new(),
             state: RwLock::new(initial),
             transition: Mutex::new(()),
+            settings_update: tokio::sync::Mutex::new(()),
             activation: ActivationGate::default(),
             model_unloading: AtomicBool::new(false),
             microphone_verified: AtomicBool::new(false),
@@ -145,19 +149,28 @@ impl AppRuntime {
 
     pub fn snapshot(&self) -> AppSnapshot {
         let settings = self.settings.get();
+        let backends = models::descriptors()
+            .into_iter()
+            .map(|mut backend| {
+                backend.installed = self.assets.status(&backend.id).complete;
+                backend
+            })
+            .collect();
+        let setup_complete = self.assets.status(&settings.backend_id).complete;
         AppSnapshot {
             onboarding_complete: settings.onboarding_version >= CURRENT_ONBOARDING_VERSION,
             settings,
             state: self.state.read().expect("state lock poisoned").clone(),
             backend: self.backend.descriptor(),
-            setup_complete: self.assets.status().complete,
+            backends,
+            setup_complete,
             platform: platform_name(),
             wayland: is_wayland(),
         }
     }
 
     pub fn setup_status(&self) -> SetupStatus {
-        self.assets.status()
+        self.assets.status(&self.settings.get().backend_id)
     }
 
     pub fn set_state(&self, state: DictationState) {
@@ -165,11 +178,44 @@ impl AppRuntime {
         let _ = self.app.emit("voice://state", state);
     }
 
-    pub fn update_settings(&self, settings: AppSettings) -> AppResult<AppSnapshot> {
-        let should_cancel = self.settings.get().enabled && !settings.enabled;
-        self.settings.save(settings)?;
+    pub async fn update_settings(&self, settings: AppSettings) -> AppResult<AppSnapshot> {
+        let _update = self.settings_update.lock().await;
+        let previous = self.settings.get();
+        let backend_changed = previous.backend_id != settings.backend_id;
+        let locale_changed = previous.locale != settings.locale;
+        let hotkey_changed = previous.hotkey.key != settings.hotkey.key;
+        if (backend_changed || locale_changed || hotkey_changed) && self.activation.is_busy() {
+            return Err(AppError::new(
+                "dictation_active",
+                "Finish the current dictation before changing the model, language, or hold key.",
+            ));
+        }
+        if backend_changed {
+            self.backend.switch_backend(&settings.backend_id).await?;
+        }
+        if let Err(error) = self.settings.save(settings.clone()) {
+            if backend_changed {
+                if let Err(rollback) = self.backend.switch_backend(&previous.backend_id).await {
+                    eprintln!("Zui. Voice could not restore the previous backend: {rollback}");
+                }
+            }
+            return Err(error);
+        }
+        let should_cancel = previous.enabled && !settings.enabled;
         if should_cancel {
             self.cancel();
+        }
+        if backend_changed {
+            let status = self.assets.status(&settings.backend_id);
+            self.set_state(if status.complete {
+                DictationState::Idle {
+                    backend_status: BackendStatus::Stopped,
+                }
+            } else {
+                DictationState::SetupRequired {
+                    detail: "Download the selected model before dictating.".into(),
+                }
+            });
         }
         Ok(self.snapshot())
     }
@@ -211,11 +257,24 @@ impl AppRuntime {
         self.hotkey_probe_armed.store(false, Ordering::Release);
     }
 
-    pub fn complete_onboarding(&self, input_device_name: Option<String>) -> AppResult<AppSnapshot> {
-        if !self.assets.status().complete {
+    pub fn confirm_hotkey_test(&self) -> bool {
+        if !self.hotkey_probe_armed.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.hotkey_verified.store(true, Ordering::Release);
+        let _ = self.app.emit("voice://hotkey-test", ());
+        true
+    }
+
+    pub async fn complete_onboarding(
+        &self,
+        input_device_name: Option<String>,
+    ) -> AppResult<AppSnapshot> {
+        let current = self.settings.get();
+        if !self.assets.status(&current.backend_id).complete {
             return Err(AppError::new(
                 "setup_incomplete",
-                "Install the speech engine and Vietnamese model first.",
+                "Install the speech engine and selected model first.",
             ));
         }
         if !self.microphone_verified.load(Ordering::Acquire) {
@@ -233,7 +292,7 @@ impl AppRuntime {
         let mut settings = self.settings.get();
         settings.input_device_name = input_device_name;
         settings.onboarding_version = CURRENT_ONBOARDING_VERSION;
-        self.update_settings(settings)
+        self.update_settings(settings).await
     }
 
     pub async fn unload_model(&self) -> AppResult<AppSnapshot> {
@@ -271,16 +330,14 @@ impl AppRuntime {
     }
 
     pub fn press(self: &Arc<Self>) {
-        if self.hotkey_probe_armed.swap(false, Ordering::AcqRel) {
-            self.hotkey_verified.store(true, Ordering::Release);
-            let _ = self.app.emit("voice://hotkey-test", ());
+        if self.confirm_hotkey_test() {
             return;
         }
         let _transition = self.transition.lock().expect("transition lock poisoned");
         let settings = self.settings.get();
         if self.model_unloading.load(Ordering::Acquire)
             || !settings.enabled
-            || !self.assets.status().complete
+            || !self.assets.status(&settings.backend_id).complete
             || settings.onboarding_version < CURRENT_ONBOARDING_VERSION
         {
             return;
@@ -366,11 +423,15 @@ impl AppRuntime {
             remove_private_file(&artifact.path).await;
             return;
         }
+        let transcription_settings = self.settings.get();
+        let model_name = models::backend(&transcription_settings.backend_id)
+            .map(|backend| backend.name)
+            .unwrap_or("speech");
         if self.backend.status() != BackendStatus::Ready
             && !self.set_state_for(
                 session,
                 DictationState::Loading {
-                    detail: "Loading the Vietnamese model".into(),
+                    detail: format!("Loading {model_name}"),
                 },
             )
         {
@@ -396,7 +457,7 @@ impl AppRuntime {
             .backend
             .transcribe(TranscriptionRequest {
                 audio_path: &artifact.path,
-                language: "vi",
+                language: &transcription_settings.locale,
             })
             .await;
         remove_private_file(&artifact.path).await;
@@ -469,6 +530,7 @@ impl AppRuntime {
         self.recorder.cancel_session(session);
         self.take_target(session);
         eprintln!("Zui. Voice error [{}]: {}", error.code, error.message);
+        prepare_overlay_error(&self.app);
         self.set_state(DictationState::Error { error });
         if !self.activation.complete(session) {
             return;

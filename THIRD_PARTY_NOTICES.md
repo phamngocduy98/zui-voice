@@ -1,25 +1,38 @@
 # Third-Party Notices
 
-## NVIDIA Parakeet CTC 0.6B Vietnamese
+## NVIDIA Nemotron 3.5 ASR Streaming 0.6B
 
-The `parakeet-ctc-0.6b-Vietnamese-q8_0.gguf` release asset is a quantized
-conversion of NVIDIA's Parakeet CTC 0.6B Vietnamese model.
+The `nemotron-3.5-asr-streaming-0.6b-q8_0.gguf` asset is a Q8_0 conversion of
+NVIDIA's Nemotron 3.5 multilingual ASR model.
 
-- Source model: https://huggingface.co/nvidia/parakeet-ctc-0.6b-Vietnamese
-- Governing terms: https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/
-- Model version: Parakeet-CTC-0.6B-unified ASR Vietnamese_1.1
+- Source model: https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
+- Source model release: `nemotron-3.5-asr-streaming-0.6b-v1`, published June 4, 2026
+- GGUF conversion: https://huggingface.co/mudler/parakeet-cpp-gguf
+- Pinned conversion revision: `bf0af9f425fa01809cadec671b3cb672709d13e9`
+- Release artifact SHA-256: `ba2f13eccd4a5245be728f77e6149bd6a4fdcdd133ff2e08ac6005bcef7a99f1`
+- Governing model terms: OpenMDW-1.1, reproduced in `licenses/OpenMDW-1.1.txt`
+- Conversion publisher: mudler/parakeet-cpp-gguf
+- Converter repository metadata: CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)
 
-The source model card states that the model is ready for commercial and
-non-commercial use. Use and redistribution remain subject to the NVIDIA Open
-Model License.
+The distributed artifact is a converted and Q8_0-quantized form of the NVIDIA
+checkpoint, not the original checkpoint. Its pinned size and SHA-256 are verified
+before release and again by Zui. Voice before installation.
 
-The model produces probabilistic transcripts and may be inaccurate for noisy
-audio, unfamiliar accents, names, or specialized terminology.
+Zui. Voice exposes only the 19 transcription-ready and 13 broad-coverage
+locales identified by NVIDIA. It deliberately excludes the 8 adaptation-ready
+locales, which require fine-tuning. The application records a complete utterance
+and transcribes after key release; it does not expose the model's live-streaming
+mode.
+
+The model produces probabilistic transcripts. Accuracy depends on language,
+accent, audio conditions, and domain. Users must validate it for their use case.
 
 ## parakeet.cpp
 
-The `parakeet-server.exe` release asset is based on parakeet.cpp 0.4.0:
-https://github.com/mudler/parakeet.cpp/tree/v0.4.0
+The `parakeet-server.exe` release asset is based on parakeet.cpp commit
+`e8acc6172a94e20a952cf1843decace5d771a94b` (the v0.4.0 tag), with the small
+language-forwarding patch in `patches/parakeet-server-language.patch`:
+https://github.com/mudler/parakeet.cpp/tree/e8acc6172a94e20a952cf1843decace5d771a94b
 
 MIT License
 

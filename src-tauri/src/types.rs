@@ -36,6 +36,7 @@ pub struct AppSettings {
     pub hotkey: HotkeyBinding,
     pub input_device_name: Option<String>,
     pub backend_id: String,
+    pub locale: String,
     pub launch_at_login: bool,
     pub clipboard_restore: bool,
     pub max_recording_seconds: u64,
@@ -53,7 +54,8 @@ impl Default for AppSettings {
                 consume: true,
             },
             input_device_name: None,
-            backend_id: "parakeet-vietnamese".into(),
+            backend_id: crate::models::NEMOTRON_ID.into(),
+            locale: "vi-VN".into(),
             launch_at_login: false,
             clipboard_restore: true,
             max_recording_seconds: 300,
@@ -71,18 +73,25 @@ pub struct BackendDescriptor {
     pub id: String,
     pub name: String,
     pub language: String,
+    pub description: String,
     pub model: String,
+    pub installed: bool,
+    pub locales: Vec<LanguageDescriptor>,
 }
 
-impl Default for BackendDescriptor {
-    fn default() -> Self {
-        Self {
-            id: "parakeet-vietnamese".into(),
-            name: "Parakeet CTC".into(),
-            language: "Vietnamese".into(),
-            model: "parakeet-ctc-0.6b-Vietnamese-q8_0.gguf".into(),
-        }
-    }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LanguageTier {
+    TranscriptionReady,
+    BroadCoverage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageDescriptor {
+    pub locale: String,
+    pub name: String,
+    pub tier: LanguageTier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
@@ -156,6 +165,7 @@ pub struct AppSnapshot {
     pub settings: AppSettings,
     pub state: DictationState,
     pub backend: BackendDescriptor,
+    pub backends: Vec<BackendDescriptor>,
     pub setup_complete: bool,
     pub onboarding_complete: bool,
     pub platform: String,
@@ -165,6 +175,7 @@ pub struct AppSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupStatus {
+    pub backend_id: String,
     pub complete: bool,
     pub server_found: bool,
     pub model_found: bool,

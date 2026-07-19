@@ -1,6 +1,6 @@
 # Zui. Voice
 
-Zui. Voice is a local-first, push-to-talk Vietnamese dictation app. Hold **Right Alt**, speak, and release to insert the transcript into the app that was focused when recording began.
+Zui. Voice is a local-first, push-to-talk dictation app powered by multilingual Nemotron 3.5 ASR. Hold your configured key, speak, and release to insert the transcript into the app that was focused when recording began.
 
 ## Development
 
@@ -10,12 +10,16 @@ Prerequisites:
 - Rust stable with the platform's Tauri prerequisites
 - The development assets in `bin/`:
   - `parakeet-server.exe` (or `parakeet-server` on Unix)
-  - `parakeet-ctc-0.6b-Vietnamese-q8_0.gguf`
+  - `nemotron-3.5-asr-streaming-0.6b-q8_0.gguf`
 
 ```powershell
-npm install
+npm ci
 npm run tauri dev
 ```
+
+The release runtime is a pinned parakeet.cpp v0.4.0 build with a patch that
+forwards the OpenAI-compatible multipart `language` field to Nemotron's language
+prompt. Build it on Windows with `./scripts/build-parakeet-runtime.ps1`.
 
 The app records 16 kHz mono WAV audio only while the hold key is down. Audio is deleted immediately after transcription and transcript history is never stored.
 
@@ -24,15 +28,15 @@ The app records 16 kHz mono WAV audio only while the hold key is down. Audio is 
 The React UI receives typed state and spectrum events from a Rust controller. Native responsibilities are isolated behind services:
 
 - `AudioRecorder`: microphone capture, downmixing, resampling, silence rejection, WAV creation.
-- `TranscriptionBackend`: replaceable backend contract. `ParakeetBackend` supervises the local OpenAI-compatible server; a future `WhisperCppBackend` can use the same contract.
+- `TranscriptionBackend`: replaceable backend contract. `ParakeetBackend` supervises the local OpenAI-compatible server and Nemotron GGUF model.
 - `HotkeyService`: global press/release events with a Windows low-level hook and portable desktop fallback.
 - `ClipboardService`: common-format snapshot, guarded paste, and race-safe restore.
 - `platform`: foreground-target validation and caret/pointer overlay placement.
-- `AssetManager`: release manifest, resumable downloads, SHA-256 verification, and atomic install.
+- `AssetManager`: model-aware release manifest, on-demand resumable downloads, SHA-256 verification, and atomic install.
 
 ## Release assets
 
-Release builds default to the versioned manifest in their matching GitHub release (for example, `v0.1.0/release-manifest.json`). `ZUI_RELEASE_MANIFEST_URL` can override that location at runtime or build time. Every asset is selected by OS/architecture and verified before installation. Model and runtime attribution is recorded in `THIRD_PARTY_NOTICES.md`.
+Release builds default to the versioned schema-2 manifest in their matching GitHub release (for example, `v0.2.0/release-manifest.json`). `ZUI_RELEASE_MANIFEST_URL` can override that location at runtime or build time. The runtime and Nemotron model are downloaded from the matching GitHub release and verified. Model and runtime attribution is recorded in `THIRD_PARTY_NOTICES.md`.
 
 ## Platform notes
 

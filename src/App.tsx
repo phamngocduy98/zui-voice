@@ -38,15 +38,16 @@ export function App() {
   const hotkeyLabel = formatHotkeyLabel(snapshot.settings.hotkey.key, platform);
 
   if (isOverlay) {
-    return <Overlay state={snapshot.state} bins={bins} hotkeyLabel={hotkeyLabel} />;
+    return <Overlay state={snapshot.state} bins={bins} />;
   }
   if (showOnboarding && setup) {
     return (
       <Onboarding
         setup={setup}
+        snapshot={snapshot}
         platform={platform}
-        hotkeyLabel={hotkeyLabel}
         inputDeviceName={snapshot.settings.inputDeviceName}
+        onChange={setSnapshot}
         onReady={reload}
       />
     );

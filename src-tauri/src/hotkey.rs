@@ -6,9 +6,39 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
-    Pressed,
-    Released,
+    Pressed(HoldKey),
+    Released(HoldKey),
     Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldKey {
+    RightAlt,
+    RightControl,
+    F8,
+    F9,
+}
+
+impl HoldKey {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::RightAlt => "RightAlt",
+            Self::RightControl => "RightControl",
+            Self::F8 => "F8",
+            Self::F9 => "F9",
+        }
+    }
+}
+
+pub fn is_supported_hold_key(value: &str) -> bool {
+    [
+        HoldKey::RightAlt,
+        HoldKey::RightControl,
+        HoldKey::F8,
+        HoldKey::F9,
+    ]
+    .iter()
+    .any(|key| key.id() == value)
 }
 
 #[derive(Default)]
@@ -56,7 +86,9 @@ mod windows_hook {
     use windows_sys::Win32::{
         Foundation::{LPARAM, LRESULT, WPARAM},
         UI::{
-            Input::KeyboardAndMouse::{VK_ESCAPE, VK_MENU, VK_RMENU},
+            Input::KeyboardAndMouse::{
+                VK_CONTROL, VK_ESCAPE, VK_F8, VK_F9, VK_MENU, VK_RCONTROL, VK_RMENU,
+            },
             WindowsAndMessaging::{
                 CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
                 UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN,
@@ -66,8 +98,24 @@ mod windows_hook {
     };
 
     static HANDLER: OnceLock<Arc<dyn Fn(HotkeyEvent) -> bool + Send + Sync>> = OnceLock::new();
-    static RIGHT_ALT: PhysicalKeyLatch = PhysicalKeyLatch(AtomicBool::new(false));
-    static CONSUME_RIGHT_ALT: AtomicBool = AtomicBool::new(true);
+    struct KeyState {
+        latch: PhysicalKeyLatch,
+        consume: AtomicBool,
+    }
+
+    impl KeyState {
+        const fn new() -> Self {
+            Self {
+                latch: PhysicalKeyLatch(AtomicBool::new(false)),
+                consume: AtomicBool::new(false),
+            }
+        }
+    }
+
+    static RIGHT_ALT: KeyState = KeyState::new();
+    static RIGHT_CONTROL: KeyState = KeyState::new();
+    static F8: KeyState = KeyState::new();
+    static F9: KeyState = KeyState::new();
 
     pub fn start(handler: Arc<dyn Fn(HotkeyEvent) -> bool + Send + Sync>) -> AppResult<()> {
         HANDLER.set(handler).map_err(|_| {
@@ -108,21 +156,35 @@ mod windows_hook {
             let down = wparam == WM_KEYDOWN as usize || wparam == WM_SYSKEYDOWN as usize;
             let up = wparam == WM_KEYUP as usize || wparam == WM_SYSKEYUP as usize;
             let extended = data.flags & 0x01 != 0;
-            let right_alt =
-                data.vkCode == VK_RMENU as u32 || (data.vkCode == VK_MENU as u32 && extended);
-            if right_alt {
-                if down && RIGHT_ALT.press() {
+            let hold_key =
+                if data.vkCode == VK_RMENU as u32 || (data.vkCode == VK_MENU as u32 && extended) {
+                    Some((HoldKey::RightAlt, &RIGHT_ALT))
+                } else if data.vkCode == VK_RCONTROL as u32
+                    || (data.vkCode == VK_CONTROL as u32 && extended)
+                {
+                    Some((HoldKey::RightControl, &RIGHT_CONTROL))
+                } else if data.vkCode == VK_F8 as u32 {
+                    Some((HoldKey::F8, &F8))
+                } else if data.vkCode == VK_F9 as u32 {
+                    Some((HoldKey::F9, &F9))
+                } else {
+                    None
+                };
+            if let Some((key, state)) = hold_key {
+                if down && state.latch.press() {
                     if let Some(handler) = HANDLER.get() {
-                        let consume = handler(HotkeyEvent::Pressed);
-                        CONSUME_RIGHT_ALT.store(consume, Ordering::Release);
+                        state
+                            .consume
+                            .store(handler(HotkeyEvent::Pressed(key)), Ordering::Release);
                     }
-                } else if up && RIGHT_ALT.release() {
+                } else if up && state.latch.release() {
                     if let Some(handler) = HANDLER.get() {
-                        let consume = handler(HotkeyEvent::Released);
-                        CONSUME_RIGHT_ALT.store(consume, Ordering::Release);
+                        state
+                            .consume
+                            .store(handler(HotkeyEvent::Released(key)), Ordering::Release);
                     }
                 }
-                if CONSUME_RIGHT_ALT.load(Ordering::Acquire) {
+                if state.consume.load(Ordering::Acquire) {
                     return 1;
                 }
             }
@@ -141,18 +203,39 @@ mod portable_hook {
     use super::*;
     use rdev::{listen, EventType, Key};
 
+    fn hold_key(key: Key) -> Option<(HoldKey, usize)> {
+        match key {
+            Key::AltGr => Some((HoldKey::RightAlt, 0)),
+            Key::ControlRight => Some((HoldKey::RightControl, 1)),
+            Key::F8 => Some((HoldKey::F8, 2)),
+            Key::F9 => Some((HoldKey::F9, 3)),
+            _ => None,
+        }
+    }
+
     pub fn start(handler: Arc<dyn Fn(HotkeyEvent) -> bool + Send + Sync>) -> AppResult<()> {
-        let right_alt = Arc::new(PhysicalKeyLatch::default());
+        let latches = Arc::new([
+            PhysicalKeyLatch::default(),
+            PhysicalKeyLatch::default(),
+            PhysicalKeyLatch::default(),
+            PhysicalKeyLatch::default(),
+        ]);
         let (exit_sender, exit_receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("zui-hotkey".into())
             .spawn(move || {
                 let result = listen(move |event| match event.event_type {
-                    EventType::KeyPress(Key::AltGr) if right_alt.press() => {
-                        let _ = handler(HotkeyEvent::Pressed);
+                    EventType::KeyPress(key)
+                        if hold_key(key).is_some_and(|(_, index)| latches[index].press()) =>
+                    {
+                        let (key, _) = hold_key(key).expect("supported key");
+                        let _ = handler(HotkeyEvent::Pressed(key));
                     }
-                    EventType::KeyRelease(Key::AltGr) if right_alt.release() => {
-                        let _ = handler(HotkeyEvent::Released);
+                    EventType::KeyRelease(key)
+                        if hold_key(key).is_some_and(|(_, index)| latches[index].release()) =>
+                    {
+                        let (key, _) = hold_key(key).expect("supported key");
+                        let _ = handler(HotkeyEvent::Released(key));
                     }
                     EventType::KeyPress(Key::Escape) => {
                         let _ = handler(HotkeyEvent::Cancel);

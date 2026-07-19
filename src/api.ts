@@ -10,11 +10,43 @@ import type {
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
+const ready = (locale: string, name: string) => ({ locale, name, tier: "transcriptionReady" as const });
+const broad = (locale: string, name: string) => ({ locale, name, tier: "broadCoverage" as const });
+const fallbackBackends = [
+  {
+    id: "nemotron-3.5-asr-streaming-0.6b",
+    name: "Nemotron 3.5 ASR",
+    language: "Multilingual",
+    description: "32 production-ready locales, Q8, local only",
+    model: "nemotron-3.5-asr-streaming-0.6b-q8_0.gguf",
+    installed: true,
+    locales: [
+      ready("en-US", "English (United States)"), ready("en-GB", "English (United Kingdom)"),
+      ready("es-US", "Spanish (United States)"), ready("es-ES", "Spanish (Spain)"),
+      ready("fr-FR", "French (France)"), ready("fr-CA", "French (Canada)"),
+      ready("de-DE", "German (Germany)"), ready("it-IT", "Italian (Italy)"),
+      ready("pt-BR", "Portuguese (Brazil)"), ready("pt-PT", "Portuguese (Portugal)"),
+      ready("nl-NL", "Dutch (Netherlands)"), ready("ru-RU", "Russian (Russia)"),
+      ready("ja-JP", "Japanese (Japan)"), ready("ko-KR", "Korean (South Korea)"),
+      ready("hi-IN", "Hindi (India)"), ready("ar-AR", "Arabic"),
+      ready("tr-TR", "Turkish (Turkey)"), ready("vi-VN", "Vietnamese (Vietnam)"),
+      ready("uk-UA", "Ukrainian (Ukraine)"), broad("pl-PL", "Polish (Poland)"),
+      broad("sv-SE", "Swedish (Sweden)"), broad("cs-CZ", "Czech (Czechia)"),
+      broad("nb-NO", "Norwegian Bokmal (Norway)"), broad("da-DK", "Danish (Denmark)"),
+      broad("bg-BG", "Bulgarian (Bulgaria)"), broad("fi-FI", "Finnish (Finland)"),
+      broad("hr-HR", "Croatian (Croatia)"), broad("sk-SK", "Slovak (Slovakia)"),
+      broad("zh-CN", "Mandarin (China)"), broad("hu-HU", "Hungarian (Hungary)"),
+      broad("ro-RO", "Romanian (Romania)"), broad("et-EE", "Estonian (Estonia)")
+    ]
+  }
+];
+
 const fallback: AppSnapshot = {
   settings: {
     hotkey: { key: "RightAlt", consume: true },
     inputDeviceName: null,
-    backendId: "parakeet-vietnamese",
+    backendId: "nemotron-3.5-asr-streaming-0.6b",
+    locale: "vi-VN",
     launchAtLogin: false,
     clipboardRestore: true,
     maxRecordingSeconds: 300,
@@ -24,12 +56,8 @@ const fallback: AppSnapshot = {
     onboardingVersion: 1
   },
   state: { phase: "idle", backendStatus: "stopped" },
-  backend: {
-    id: "parakeet-vietnamese",
-    name: "Parakeet CTC",
-    language: "Vietnamese",
-    model: "parakeet-ctc-0.6b-Vietnamese-q8_0.gguf"
-  },
+  backend: fallbackBackends[0],
+  backends: fallbackBackends,
   setupComplete: true,
   onboardingComplete: true,
   platform: "browser",
@@ -43,11 +71,13 @@ export async function getSnapshot(): Promise<AppSnapshot> {
 export async function getSetupStatus(): Promise<SetupStatus> {
   return inTauri()
     ? invoke("get_setup_status")
-    : { complete: true, serverFound: true, modelFound: true, serverPath: null, modelPath: null, manifestConfigured: false };
+    : { backendId: fallback.settings.backendId, complete: true, serverFound: true, modelFound: true, serverPath: null, modelPath: null, manifestConfigured: false };
 }
 
 export async function updateSettings(settings: AppSettings): Promise<AppSnapshot> {
-  return inTauri() ? invoke("update_settings", { settings }) : { ...fallback, settings };
+  if (inTauri()) return invoke("update_settings", { settings });
+  const backend = fallbackBackends.find((item) => item.id === settings.backendId) ?? fallback.backend;
+  return { ...fallback, settings, backend };
 }
 
 export async function listInputDevices(): Promise<string[]> {
@@ -64,6 +94,10 @@ export async function beginHotkeyTest(): Promise<void> {
 
 export async function getHotkeyTestStatus(): Promise<boolean> {
   return inTauri() ? invoke("get_hotkey_test_status") : false;
+}
+
+export async function confirmHotkeyTest(): Promise<boolean> {
+  return inTauri() ? invoke("confirm_hotkey_test") : true;
 }
 
 export async function cancelHotkeyTest(): Promise<void> {

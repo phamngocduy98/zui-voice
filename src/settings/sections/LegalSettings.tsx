@@ -37,9 +37,9 @@ export function LegalSettings() {
           <div className="legal-row">
             <Scale />
             <div>
-              <strong>NVIDIA Parakeet CTC Vietnamese</strong>
-              <small>The application expects a quantized derivative of NVIDIA’s Vietnamese model. Exact GGUF provenance and redistribution terms must be verified before it is published.</small>
-              <a href="https://huggingface.co/nvidia/parakeet-ctc-0.6b-Vietnamese" target="_blank" rel="noreferrer">Base model page <ExternalLink /></a>
+              <strong>NVIDIA Nemotron 3.5 ASR</strong>
+              <small>The multilingual Q8 model is governed by OpenMDW-1.1 and exposes 32 transcription-ready or broad-coverage locales.</small>
+              <a href="https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b" target="_blank" rel="noreferrer">Base model page <ExternalLink /></a>
             </div>
           </div>
         </div>
