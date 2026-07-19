@@ -123,17 +123,21 @@ impl ParakeetBackend {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let mut child = command
+        let child = command
             .spawn()
             .map_err(|e| AppError::new("backend_spawn", e.to_string()))?;
         #[cfg(windows)]
-        let process_job = match windows_process::ProcessJob::attach(&child) {
-            Ok(job) => job,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(AppError::new("backend_spawn", error.to_string()));
-            }
+        let (child, process_job) = {
+            let mut child = child;
+            let process_job = match windows_process::ProcessJob::attach(&child) {
+                Ok(job) => job,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(AppError::new("backend_spawn", error.to_string()));
+                }
+            };
+            (child, process_job)
         };
         *self.process.lock().expect("backend process lock poisoned") = Some(child);
         #[cfg(windows)]

@@ -643,6 +643,7 @@ mod tests {
                 .expect("release manifest should parse");
 
         validate_manifest(&manifest).expect("release manifest should be valid");
+        #[cfg(windows)]
         select_asset_set(&manifest, "windows", "x86_64")
             .expect("release manifest should support Windows x64");
         assert_eq!(manifest.release, env!("CARGO_PKG_VERSION"));
