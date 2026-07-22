@@ -99,7 +99,7 @@ index 4187ed2..33975c8 100644
 +            if (it->second->last_used < cutoff) it = streams.erase(it); else ++it;
 +        }
 +    };
-
+ 
      httplib::Server svr;
 @@ -169,6 +217,46 @@ int main(int argc, char** argv) {
          }
