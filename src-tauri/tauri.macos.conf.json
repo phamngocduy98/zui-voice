@@ -30,6 +30,22 @@
         "focus": false,
         "visible": false,
         "shadow": false
+      },
+      {
+        "label": "subtitle",
+        "url": "index.html?view=subtitle",
+        "width": 720,
+        "height": 132,
+        "minWidth": 360,
+        "minHeight": 80,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": true,
+        "focus": false,
+        "visible": false,
+        "shadow": false
       }
     ]
   }

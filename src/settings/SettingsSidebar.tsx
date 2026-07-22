@@ -1,9 +1,10 @@
-import { Gauge, Headphones, Info, Search, Settings2, SunMoon, type LucideIcon } from "lucide-react";
+import { Captions, Gauge, Headphones, Info, Search, Settings2, SunMoon, type LucideIcon } from "lucide-react";
 import type { SettingsSection } from "./types";
 
 const sections: Array<{ id: SettingsSection; label: string; search: string; icon: LucideIcon }> = [
   { id: "dictation", label: "Dictation", search: "dictation push to talk", icon: Settings2 },
   { id: "audio", label: "Audio", search: "audio microphone", icon: Headphones },
+  { id: "subtitles", label: "Live Subtitles", search: "subtitles captions computer system audio privacy", icon: Captions },
   { id: "engine", label: "Local Engine", search: "local engine model", icon: Gauge },
   { id: "appearance", label: "Appearance", search: "appearance theme light dark system", icon: SunMoon },
   { id: "legal", label: "Legal & Privacy", search: "legal privacy license notices model nemotron parakeet runtime", icon: Info }

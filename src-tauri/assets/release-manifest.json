@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "release": "0.2.0",
-  "engineVersion": "0.4.0-zui.1",
-  "licenseNoticeUrl": "https://github.com/phamngocduy98/zui-voice/blob/v0.2.0/THIRD_PARTY_NOTICES.md",
+  "release": "0.3.0",
+  "engineVersion": "0.4.0-zui.2",
+  "licenseNoticeUrl": "https://github.com/phamngocduy98/zui-voice/blob/v0.3.0/THIRD_PARTY_NOTICES.md",
   "assets": [
     {
       "id": "model-nemotron-3.5-q8",
@@ -11,7 +11,7 @@
       "platform": "all",
       "arch": "all",
       "filename": "nemotron-3.5-asr-streaming-0.6b-q8_0.gguf",
-      "url": "https://github.com/phamngocduy98/zui-voice/releases/download/v0.2.0/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf",
+      "url": "https://github.com/phamngocduy98/zui-voice/releases/download/v0.3.0/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf",
       "size": 983696512,
       "sha256": "ba2f13eccd4a5245be728f77e6149bd6a4fdcdd133ff2e08ac6005bcef7a99f1"
     },
@@ -21,9 +21,9 @@
       "platform": "windows",
       "arch": "x86_64",
       "filename": "parakeet-server.exe",
-      "url": "https://github.com/phamngocduy98/zui-voice/releases/download/v0.2.0/parakeet-server.exe",
-      "size": 1702400,
-      "sha256": "079d7882c14869d8e3e0b9691c64c8fc7be379767c72173b8ed7e6b146a8f639"
+      "url": "https://github.com/phamngocduy98/zui-voice/releases/download/v0.3.0/parakeet-server.exe",
+      "size": 1751040,
+      "sha256": "47b0e2d82ad06b52d9bd56d4a28186fde75411f241cf805bca07b23acc098576"
     }
   ]
 }

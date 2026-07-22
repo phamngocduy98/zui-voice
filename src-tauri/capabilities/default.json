@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Minimal UI capabilities for Zui. Voice",
-  "windows": ["main", "overlay"],
+  "windows": ["main", "overlay", "subtitle"],
   "permissions": [
     "core:default",
     "core:event:default",

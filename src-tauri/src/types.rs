@@ -2,6 +2,81 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const CURRENT_ONBOARDING_VERSION: u32 = 1;
+pub const DEFAULT_SUBTITLE_MAX_LINES: u8 = 3;
+pub const MAX_SUBTITLE_MAX_LINES: u8 = 6;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitlePosition {
+    pub x: i32,
+    pub y: i32,
+    pub monitor_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+pub struct SubtitleSettings {
+    pub overlay_locked: bool,
+    pub position: Option<SubtitlePosition>,
+    pub max_lines: u8,
+}
+
+impl Default for SubtitleSettings {
+    fn default() -> Self {
+        Self {
+            overlay_locked: false,
+            position: None,
+            max_lines: DEFAULT_SUBTITLE_MAX_LINES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SystemAudioPermission {
+    NotRequired,
+    NotDetermined,
+    Granted,
+    Denied,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemAudioCapabilities {
+    pub available: bool,
+    pub permission: SystemAudioPermission,
+    pub implementation: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(tag = "phase", rename_all = "camelCase")]
+pub enum SubtitleState {
+    #[default]
+    Disabled,
+    Starting,
+    RequestingPermission,
+    Listening,
+    PausedForDictation,
+    Stopping,
+    Error {
+        error: AppError,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleText {
+    pub session_id: u64,
+    pub revision: u64,
+    pub utterance_id: u64,
+    pub stable_text: String,
+    pub unstable_text: String,
+    pub is_final: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +119,7 @@ pub struct AppSettings {
     pub enabled: bool,
     pub theme: ThemePreference,
     pub onboarding_version: u32,
+    pub subtitles: SubtitleSettings,
 }
 
 impl Default for AppSettings {
@@ -63,6 +139,7 @@ impl Default for AppSettings {
             enabled: true,
             theme: ThemePreference::System,
             onboarding_version: 0,
+            subtitles: SubtitleSettings::default(),
         }
     }
 }
@@ -170,6 +247,8 @@ pub struct AppSnapshot {
     pub onboarding_complete: bool,
     pub platform: String,
     pub wayland: bool,
+    pub subtitle_state: SubtitleState,
+    pub system_audio_capabilities: SystemAudioCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

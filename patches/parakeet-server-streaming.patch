@@ -1,0 +1,150 @@
+diff --git a/examples/server/main.cpp b/examples/server/main.cpp
+index 4187ed2..33975c8 100644
+--- a/examples/server/main.cpp
++++ b/examples/server/main.cpp
+@@ -5,12 +5,21 @@
+ #include "parakeet.h"        // parakeet_version
+ #include "model.hpp"          // pk::Model
++#include "streaming.hpp"
++#include "mel.hpp"
++#include "transcription_json.hpp"
+ #include "transcription.hpp"  // pk::Transcription
+ #include "ggml_graph.hpp"     // pk::set_num_threads, pk::shutdown_backend
+ #include "dr_wav.h"           // declarations only; impl lives in libparakeet
+
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstring>
+ #include <csignal>
+ #include <cstdio>
+ #include <memory>
+ #include <mutex>
++#include <unordered_map>
+ #include <string>
+ #include <vector>
+@@ -20,6 +25,63 @@ namespace {
+ httplib::Server* g_server = nullptr;
+ void on_signal(int) { if (g_server) g_server->stop(); }
+ 
++
++// Server-private streaming transport over the same already-loaded model. The model graph is
++// serialized with batch inference by infer_mu; it never calls parakeet_capi_load.
++struct StreamState {
++    std::unique_ptr<pk::StreamingMel> mel;
++    std::unique_ptr<pk::StreamingSession> session;
++    std::vector<float> mel_buf;
++    int n_mels = 0, mel_t = 0, next = 0;
++    std::chrono::steady_clock::time_point last_used = std::chrono::steady_clock::now();
++    bool first = true;
++    static constexpr int kMaxMelFrames = 3000; // bounded ~4 minutes at 80 ms frames
++    void compact() {
++        const int keep_from = std::max(0, next - session->pre_encode_cache_size());
++        if (keep_from == 0 || mel_t <= kMaxMelFrames) return;
++        const int retained = mel_t - keep_from;
++        std::vector<float> compacted((size_t)n_mels * retained);
++        for (int m = 0; m < n_mels; ++m) std::copy_n(mel_buf.data() + (size_t)m * mel_t + keep_from, retained, compacted.data() + (size_t)m * retained);
++        mel_buf.swap(compacted); mel_t = retained; next -= keep_from;
++    }
++    explicit StreamState(const pk::ModelLoader& loader, const std::string& language)
++        : mel(new pk::StreamingMel(loader)), session(new pk::StreamingSession(loader, language)), n_mels(mel->n_mels()) {}
++    void append(const std::vector<float>& frames, int count) {
++        if (!count) return;
++        const int old = mel_t, now = old + count;
++        std::vector<float> all((size_t)n_mels * now);
++        for (int m = 0; m < n_mels; ++m) {
++            for (int t = 0; t < old; ++t) all[(size_t)m * now + t] = mel_buf[(size_t)m * old + t];
++            for (int t = 0; t < count; ++t) all[(size_t)m * now + old + t] = frames[(size_t)m * count + t];
++        }
++        mel_buf.swap(all); mel_t = now;
++    }
++    std::string feed(const float* pcm, int count, bool finalize) {
++        int added = 0;
++        append(finalize ? mel->finalize(added) : mel->feed(pcm, count, added), added);
++        std::string text;
++        while (next < mel_t) {
++            const int chunk = first ? session->chunk_size_first() : session->chunk_size();
++            const int hi = std::min(next + chunk, mel_t);
++            if (!finalize && hi == mel_t) break;
++            const int lo = first ? next : std::max(0, next - session->pre_encode_cache_size());
++            const int width = hi - lo;
++            std::vector<float> window((size_t)n_mels * width);
++            for (int m = 0; m < n_mels; ++m) for (int t = 0; t < width; ++t)
++                window[(size_t)m * width + t] = mel_buf[(size_t)m * mel_t + lo + t];
++            const bool last = finalize && hi == mel_t;
++            session->feed_mel_chunk(window, width, last); text += session->take_new_text();
++            next += chunk; first = false; if (last) break;
++        }
++        if (finalize) text += session->finalize();
++        compact(); last_used = std::chrono::steady_clock::now();
++        bool eou = false, eob = false;
++        for (const auto& event : session->drain_events()) event.is_eob ? eob = true : eou = true;
++        std::string json = "{\"text\":"; pk::append_json_string(json, text);
++        json += ",\"eou\":" + std::to_string(eou) + ",\"eob\":" + std::to_string(eob);
++        return json + ",\"frame_sec\":0.080000,\"events\":[],\"words\":[]}";
++    }
++};
+ // Decode WAV bytes in memory into mono float PCM. Returns false if the bytes
+ // are not a decodable, non-empty WAV (so a bad/empty upload becomes a 400, not
+ // a 500 from the inference path). The model resamples to 16 kHz internally, so
+@@ -109,3 +155,12 @@ int main(int argc, char** argv) {
+     std::mutex infer_mu;
++    std::unordered_map<std::string, std::unique_ptr<StreamState>> streams;
++    std::atomic<unsigned long long> next_stream_id{0};
++    constexpr size_t kMaxStreams = 8;
++    const auto expire_streams = [&]() {
++        const auto cutoff = std::chrono::steady_clock::now() - std::chrono::minutes(2);
++        for (auto it = streams.begin(); it != streams.end();) {
++            if (it->second->last_used < cutoff) it = streams.erase(it); else ++it;
++        }
++    };
+
+     httplib::Server svr;
+@@ -169,6 +217,46 @@ int main(int argc, char** argv) {
+         }
+     });
+ 
++
++    auto stream_error = [](httplib::Response& res, int status, const char* message) {
++        res.status = status;
++        res.set_content(std::string("{\"error\":{\"message\":\"") + message + "\"}}", "application/json");
++    };
++    svr.Post("/v1/audio/streams", [&](const httplib::Request& req, httplib::Response& res) {
++        std::lock_guard<std::mutex> lock(infer_mu);
++        if (!model->config().streaming.present) { stream_error(res, 409, "model is not cache-aware streaming"); return; }
++        expire_streams(); if (streams.size() >= kMaxStreams) { stream_error(res, 429, "too many active streams"); return; }
++        try {
++            const std::string id = std::to_string(++next_stream_id);
++            const std::string language = req.has_file("language") ? req.get_file_value("language").content : "";
++            streams.emplace(id, std::unique_ptr<StreamState>(new StreamState(model->loader(), language)));
++            res.set_content("{\"id\":\"" + id + "\",\"frame_sec\":0.080000}", "application/json");
++        } catch (const std::exception&) { stream_error(res, 400, "could not create stream"); }
++    });
++    svr.Post(R"(/v1/audio/streams/([0-9]+)/feed)", [&](const httplib::Request& req, httplib::Response& res) {
++        if (req.get_header_value("Content-Type") != "application/vnd.zui.pcm-f32le" || req.get_header_value("X-Sample-Rate") != "16000" || req.get_header_value("X-Channels") != "1" || req.body.size() % sizeof(float)) { stream_error(res, 400, "expected 16 kHz mono f32le PCM"); return; }
++        std::lock_guard<std::mutex> lock(infer_mu);
++        auto it = streams.find(req.matches[1]);
++        if (it == streams.end()) { stream_error(res, 404, "stream not found"); return; }
++        try {
++            std::vector<float> pcm(req.body.size() / sizeof(float));
++            std::memcpy(pcm.data(), req.body.data(), req.body.size());
++            res.set_content(it->second->feed(pcm.data(), (int)pcm.size(), false), "application/json");
++        } catch (const std::exception&) { stream_error(res, 500, "stream feed failed"); }
++    });
++    svr.Post(R"(/v1/audio/streams/([0-9]+)/finalize)", [&](const httplib::Request& req, httplib::Response& res) {
++        std::lock_guard<std::mutex> lock(infer_mu);
++        auto it = streams.find(req.matches[1]);
++        if (it == streams.end()) { stream_error(res, 404, "stream not found"); return; }
++        try { res.set_content(it->second->feed(nullptr, 0, true), "application/json"); }
++        catch (const std::exception&) { stream_error(res, 500, "stream finalize failed"); }
++        streams.erase(it);
++    });
++    svr.Delete(R"(/v1/audio/streams/([0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
++        std::lock_guard<std::mutex> lock(infer_mu);
++        streams.erase(req.matches[1]);
++        res.status = 204;
++    });
+     std::fprintf(stderr, "parakeet-server: listening on http://%s:%d (model: %s)\n",
+                  host.c_str(), port, model_path.c_str());
+     bool ok = svr.listen(host.c_str(), port);

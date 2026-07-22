@@ -6,6 +6,44 @@ export interface HotkeyBinding {
 }
 export type HoldKey = "RightAlt" | "RightControl" | "F8" | "F9";
 export type ThemePreference = "system" | "light" | "dark";
+export type SystemAudioPermission = "notRequired" | "notDetermined" | "granted" | "denied" | "unavailable";
+
+export interface SubtitlePosition {
+  x: number;
+  y: number;
+  monitorId: string;
+}
+
+export interface SubtitleSettings {
+  overlayLocked: boolean;
+  position: SubtitlePosition | null;
+  maxLines: number;
+}
+
+export interface SystemAudioCapabilities {
+  available: boolean;
+  permission: SystemAudioPermission;
+  implementation: string;
+  detail: string;
+}
+
+export type SubtitleState =
+  | { phase: "disabled" }
+  | { phase: "starting" }
+  | { phase: "requestingPermission" }
+  | { phase: "listening" }
+  | { phase: "pausedForDictation" }
+  | { phase: "stopping" }
+  | { phase: "error"; error: AppError };
+
+export interface SubtitleText {
+  sessionId: number;
+  revision: number;
+  utteranceId: number;
+  stableText: string;
+  unstableText: string;
+  isFinal: boolean;
+}
 
 export interface AppSettings {
   hotkey: HotkeyBinding;
@@ -19,6 +57,7 @@ export interface AppSettings {
   enabled: boolean;
   theme: ThemePreference;
   onboardingVersion: number;
+  subtitles: SubtitleSettings;
 }
 
 export interface BackendDescriptor {
@@ -63,6 +102,8 @@ export interface AppSnapshot {
   onboardingComplete: boolean;
   platform: string;
   wayland: boolean;
+  subtitleState: SubtitleState;
+  systemAudioCapabilities: SystemAudioCapabilities;
 }
 
 export interface SetupStatus {

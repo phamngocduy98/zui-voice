@@ -20,6 +20,13 @@ export function LegalSettings() {
               <small>The explicit first-run engine download uses HTTPS. Dictation is sent only to the loopback speech server running on this computer.</small>
             </div>
           </div>
+          <div className="legal-row">
+            <LockKeyhole />
+            <div>
+              <strong>Live subtitle privacy</strong>
+              <small>Subtitles are explicitly started and capture computer audio, never microphone fallback. Their PCM and transcript text stay in bounded memory, are not written to disk or logs, and clear when subtitles stop.</small>
+            </div>
+          </div>
         </div>
       </section>
 

@@ -5,7 +5,10 @@ import type {
   AppSnapshot,
   DictationState,
   DownloadProgress,
-  SetupStatus
+  SetupStatus,
+  SubtitleState,
+  SubtitleText,
+  SystemAudioCapabilities
 } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
@@ -53,7 +56,8 @@ const fallback: AppSnapshot = {
     modelIdleTimeoutSeconds: 600,
     enabled: true,
     theme: "system",
-    onboardingVersion: 1
+    onboardingVersion: 1,
+    subtitles: { overlayLocked: false, position: null, maxLines: 3 }
   },
   state: { phase: "idle", backendStatus: "stopped" },
   backend: fallbackBackends[0],
@@ -61,7 +65,14 @@ const fallback: AppSnapshot = {
   setupComplete: true,
   onboardingComplete: true,
   platform: "browser",
-  wayland: false
+  wayland: false,
+  subtitleState: { phase: "disabled" },
+  systemAudioCapabilities: {
+    available: false,
+    permission: "unavailable",
+    implementation: "Browser preview",
+    detail: "System-output capture is available only in a supported desktop release."
+  }
 };
 
 export async function getSnapshot(): Promise<AppSnapshot> {
@@ -128,6 +139,32 @@ export async function retryBackend(): Promise<AppSnapshot> {
   return inTauri() ? invoke("retry_backend") : fallback;
 }
 
+export async function getSystemAudioCapabilities(): Promise<SystemAudioCapabilities> {
+  return inTauri() ? invoke("get_system_audio_capabilities") : fallback.systemAudioCapabilities;
+}
+
+export async function openSystemAudioPermissionSettings(): Promise<void> {
+  if (inTauri()) await invoke("open_system_audio_permission_settings");
+}
+
+export async function startSubtitles(): Promise<AppSnapshot> {
+  return inTauri() ? invoke("start_subtitles") : Promise.reject(new Error(fallback.systemAudioCapabilities.detail));
+}
+
+export async function stopSubtitles(): Promise<AppSnapshot> {
+  return inTauri() ? invoke("stop_subtitles") : { ...fallback, subtitleState: { phase: "disabled" } };
+}
+
+export async function setSubtitleOverlayLocked(locked: boolean): Promise<AppSnapshot> {
+  return inTauri()
+    ? invoke("set_subtitle_overlay_locked", { locked })
+    : { ...fallback, settings: { ...fallback.settings, subtitles: { ...fallback.settings.subtitles, overlayLocked: locked } } };
+}
+
+export async function resetSubtitleOverlayPosition(): Promise<AppSnapshot> {
+  return inTauri() ? invoke("reset_subtitle_overlay_position") : fallback;
+}
+
 export async function debugStart(): Promise<void> {
   if (inTauri()) await invoke("debug_start_dictation");
 }
@@ -142,6 +179,26 @@ export async function onState(handler: (state: DictationState) => void): Promise
 
 export async function onSpectrum(handler: (bins: number[]) => void): Promise<UnlistenFn> {
   return inTauri() ? listen<number[]>("voice://spectrum", (event) => handler(event.payload)) : () => undefined;
+}
+
+export async function onSubtitleState(handler: (state: SubtitleState) => void): Promise<UnlistenFn> {
+  return inTauri() ? listen<SubtitleState>("subtitle://state", (event) => handler(event.payload)) : () => undefined;
+}
+
+export async function onSubtitleText(handler: (text: SubtitleText) => void): Promise<UnlistenFn> {
+  return inTauri() ? listen<SubtitleText>("subtitle://text", (event) => handler(event.payload)) : () => undefined;
+}
+
+export async function onSubtitleClear(handler: (sessionId: number) => void): Promise<UnlistenFn> {
+  return inTauri() ? listen<number>("subtitle://clear", (event) => handler(event.payload)) : () => undefined;
+}
+
+export async function onSubtitleLock(handler: (locked: boolean) => void): Promise<UnlistenFn> {
+  return inTauri() ? listen<boolean>("subtitle://lock", (event) => handler(event.payload)) : () => undefined;
+}
+
+export async function onSubtitleSettings(handler: (settings: AppSettings["subtitles"]) => void): Promise<UnlistenFn> {
+  return inTauri() ? listen<AppSettings["subtitles"]>("subtitle://settings", (event) => handler(event.payload)) : () => undefined;
 }
 
 export async function onDownload(handler: (value: DownloadProgress) => void): Promise<UnlistenFn> {

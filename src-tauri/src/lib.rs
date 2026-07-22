@@ -4,10 +4,14 @@ mod backend;
 mod cancellation;
 mod clipboard;
 mod hotkey;
+mod inference;
 mod models;
 mod platform;
 mod runtime;
 mod settings;
+mod subtitle_stabilizer;
+mod subtitles;
+mod system_audio;
 mod types;
 
 use crate::{
@@ -15,11 +19,10 @@ use crate::{
     hotkey::{HotkeyEvent, HotkeyService, NativeHotkeyService},
     runtime::AppRuntime,
     settings::validate_settings,
-    types::{AppError, AppResult, AppSettings, AppSnapshot, SetupStatus},
+    types::{AppError, AppResult, AppSettings, AppSnapshot, SetupStatus, SystemAudioCapabilities},
 };
 use std::sync::{Arc, OnceLock};
 use tauri::{
-    image::Image,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
     AppHandle, Manager, State,
@@ -213,6 +216,45 @@ async fn retry_backend(runtime: State<'_, RuntimeState>) -> AppResult<AppSnapsho
 }
 
 #[tauri::command]
+fn get_system_audio_capabilities(
+    runtime: State<'_, RuntimeState>,
+) -> AppResult<SystemAudioCapabilities> {
+    Ok(runtime.require()?.subtitles.capabilities())
+}
+
+#[tauri::command]
+fn open_system_audio_permission_settings(runtime: State<'_, RuntimeState>) -> AppResult<()> {
+    let capability = runtime.require()?.subtitles.capabilities();
+    Err(AppError::new(
+        "system_audio_unsupported",
+        format!("{} {}", capability.implementation, capability.detail),
+    ))
+}
+
+#[tauri::command]
+fn start_subtitles(runtime: State<'_, RuntimeState>) -> AppResult<AppSnapshot> {
+    runtime.require()?.start_subtitles()
+}
+
+#[tauri::command]
+fn stop_subtitles(runtime: State<'_, RuntimeState>) -> AppResult<AppSnapshot> {
+    runtime.require()?.stop_subtitles()
+}
+
+#[tauri::command]
+fn set_subtitle_overlay_locked(
+    runtime: State<'_, RuntimeState>,
+    locked: bool,
+) -> AppResult<AppSnapshot> {
+    runtime.require()?.set_subtitle_overlay_locked(locked)
+}
+
+#[tauri::command]
+fn reset_subtitle_overlay_position(runtime: State<'_, RuntimeState>) -> AppResult<AppSnapshot> {
+    runtime.require()?.reset_subtitle_overlay_position()
+}
+
+#[tauri::command]
 fn debug_start_dictation(runtime: State<'_, RuntimeState>) -> AppResult<()> {
     runtime.require()?.press();
     Ok(())
@@ -236,11 +278,45 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Zui. Voice", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "Enable / disable", true, None::<&str>)?;
     let unload = MenuItem::with_id(app, "unload", "Unload model", true, None::<&str>)?;
+    let subtitle_start_available = app
+        .state::<RuntimeState>()
+        .require()
+        .map(|runtime| runtime.subtitles.capabilities().available)
+        .unwrap_or(false);
+    let start_subtitles = MenuItem::with_id(
+        app,
+        "start-subtitles",
+        "Start subtitles (unavailable in this build)",
+        subtitle_start_available,
+        None::<&str>,
+    )?;
+    let stop_subtitles =
+        MenuItem::with_id(app, "stop-subtitles", "Stop subtitles", true, None::<&str>)?;
+    let unlock_subtitles = MenuItem::with_id(
+        app,
+        "unlock-subtitles",
+        "Unlock subtitle position",
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &toggle, &unload, &quit])?;
-    TrayIconBuilder::with_id("zui-tray")
-        .icon(tray_image())
-        .tooltip("Zui. Voice - hold your configured key to dictate")
+    let menu = Menu::with_items(
+        app,
+        &[
+            &open,
+            &toggle,
+            &unload,
+            &start_subtitles,
+            &stop_subtitles,
+            &unlock_subtitles,
+            &quit,
+        ],
+    )?;
+    let mut tray = TrayIconBuilder::with_id("zui-tray");
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.tooltip("Zui. Voice - hold your configured key to dictate")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_settings(app),
@@ -264,7 +340,27 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                     let _ = runtime.unload_model().await;
                 });
             }
-            "quit" => app.exit(0),
+            "start-subtitles" => {
+                if let Ok(runtime) = app.state::<RuntimeState>().require() {
+                    let _ = runtime.start_subtitles();
+                }
+            }
+            "stop-subtitles" => {
+                if let Ok(runtime) = app.state::<RuntimeState>().require() {
+                    let _ = runtime.stop_subtitles();
+                }
+            }
+            "unlock-subtitles" => {
+                if let Ok(runtime) = app.state::<RuntimeState>().require() {
+                    let _ = runtime.set_subtitle_overlay_locked(false);
+                }
+            }
+            "quit" => {
+                if let Ok(runtime) = app.state::<RuntimeState>().require() {
+                    runtime.shutdown_subtitles();
+                }
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -274,30 +370,6 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .build(app)?;
     Ok(())
-}
-
-fn tray_image() -> Image<'static> {
-    let size = 32usize;
-    let mut pixels = vec![0u8; size * size * 4];
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - 15.5;
-            let dy = y as f32 - 15.5;
-            let index = (y * size + x) * 4;
-            if dx * dx + dy * dy <= 14.5 * 14.5 {
-                pixels[index] = 126;
-                pixels[index + 1] = 108;
-                pixels[index + 2] = 244;
-                pixels[index + 3] = 255;
-                if x > 12 && x < 19 && y > 7 && y < 20 {
-                    pixels[index] = 255;
-                    pixels[index + 1] = 255;
-                    pixels[index + 2] = 255;
-                }
-            }
-        }
-    }
-    Image::new_owned(pixels, size as u32, size as u32)
 }
 
 pub fn run() {
@@ -320,6 +392,11 @@ pub fn run() {
             }
             if let Some(overlay) = app.get_webview_window("overlay") {
                 let _ = overlay.set_ignore_cursor_events(true);
+            }
+            if let Some(subtitle) = app.get_webview_window("subtitle") {
+                let _ = subtitle
+                    .set_ignore_cursor_events(runtime.settings.get().subtitles.overlay_locked);
+                runtime.restore_subtitle_position();
             }
             build_tray(app)?;
 
@@ -372,6 +449,11 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
+            if window.label() == "subtitle" && matches!(event, tauri::WindowEvent::Moved(_)) {
+                if let Ok(runtime) = window.app_handle().state::<RuntimeState>().require() {
+                    runtime.subtitle_window_moved();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_app_snapshot,
@@ -388,6 +470,12 @@ pub fn run() {
             cancel_asset_download,
             unload_model,
             retry_backend,
+            get_system_audio_capabilities,
+            open_system_audio_permission_settings,
+            start_subtitles,
+            stop_subtitles,
+            set_subtitle_overlay_locked,
+            reset_subtitle_overlay_position,
             debug_start_dictation,
             debug_stop_dictation
         ])

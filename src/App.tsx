@@ -1,13 +1,16 @@
 import { CircleAlert, Mic2 } from "lucide-react";
 import { Onboarding } from "./components/Onboarding";
 import { Overlay } from "./components/Overlay";
+import { SubtitleOverlay } from "./components/SubtitleOverlay";
 import { useAppTheme } from "./hooks/useAppTheme";
 import { useVoiceApp } from "./hooks/useVoiceApp";
 import { Settings } from "./settings/Settings";
 import { formatHotkeyLabel, normalizeUiPlatform } from "./ui";
 
 export function App() {
-  const isOverlay = new URLSearchParams(location.search).get("view") === "overlay";
+  const view = new URLSearchParams(location.search).get("view");
+  const isOverlay = view === "overlay";
+  const isSubtitle = view === "subtitle";
   const {
     bins,
     loadError,
@@ -39,6 +42,9 @@ export function App() {
 
   if (isOverlay) {
     return <Overlay state={snapshot.state} bins={bins} />;
+  }
+  if (isSubtitle) {
+    return <SubtitleOverlay settings={snapshot.settings.subtitles} />;
   }
   if (showOnboarding && setup) {
     return (

@@ -40,7 +40,15 @@ impl SettingsStore {
     }
 
     pub fn save(&self, settings: AppSettings) -> AppResult<()> {
+        self.update(|current| *current = settings)
+    }
+
+    /// Applies a small settings mutation while holding the persistence lock so independent UI and
+    /// native updates cannot lose one another through a stale whole-settings snapshot.
+    pub fn update(&self, mutate: impl FnOnce(&mut AppSettings)) -> AppResult<()> {
         let _save = self.save_lock.lock().expect("settings save lock poisoned");
+        let mut settings = self.value.read().expect("settings lock poisoned").clone();
+        mutate(&mut settings);
         validate_settings(&settings)?;
         let json = serde_json::to_vec_pretty(&settings)
             .map_err(|e| AppError::new("settings_serialize", e.to_string()))?;
@@ -159,6 +167,31 @@ pub fn validate_settings(settings: &AppSettings) -> AppResult<()> {
             "Idle timeout must be between 1 and 60 minutes.",
         ));
     }
+    if !(1..=crate::types::MAX_SUBTITLE_MAX_LINES).contains(&settings.subtitles.max_lines) {
+        return Err(AppError::new(
+            "invalid_subtitle_lines",
+            "Subtitle lines must be between 1 and 6.",
+        ));
+    }
+    if let Some(position) = &settings.subtitles.position {
+        if position.monitor_id.is_empty()
+            || position.monitor_id.len() > 256
+            || position.monitor_id.contains(['\r', '\n'])
+        {
+            return Err(AppError::new(
+                "invalid_subtitle_position",
+                "The subtitle monitor identifier is invalid.",
+            ));
+        }
+        if !(-100_000..=100_000).contains(&position.x)
+            || !(-100_000..=100_000).contains(&position.y)
+        {
+            return Err(AppError::new(
+                "invalid_subtitle_position",
+                "The subtitle position is outside supported display bounds.",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -211,6 +244,11 @@ mod tests {
         assert_eq!(settings.locale, "vi-VN");
         assert_eq!(settings.theme, crate::types::ThemePreference::System);
         assert_eq!(settings.onboarding_version, 0);
+        assert!(!settings.subtitles.overlay_locked);
+        assert_eq!(
+            settings.subtitles.max_lines,
+            crate::types::DEFAULT_SUBTITLE_MAX_LINES
+        );
     }
 
     #[test]
@@ -279,6 +317,32 @@ mod tests {
         write_atomically(&path, b"new settings").expect("replace settings");
 
         assert_eq!(fs::read(&path).expect("read settings"), b"new settings");
+    }
+
+    #[test]
+    fn small_updates_preserve_independent_subtitle_preferences() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = SettingsStore {
+            path: directory.path().join("settings.json"),
+            value: RwLock::new(AppSettings::default()),
+            save_lock: Mutex::new(()),
+        };
+        store
+            .update(|settings| settings.subtitles.overlay_locked = true)
+            .expect("persist lock");
+        store
+            .update(|settings| {
+                settings.subtitles.position = Some(crate::types::SubtitlePosition {
+                    x: 120,
+                    y: 48,
+                    monitor_id: "primary".into(),
+                });
+            })
+            .expect("persist position");
+
+        let settings = store.get();
+        assert!(settings.subtitles.overlay_locked);
+        assert_eq!(settings.subtitles.position.expect("position").x, 120);
     }
 
     #[test]

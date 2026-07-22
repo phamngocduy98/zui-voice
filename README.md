@@ -23,6 +23,10 @@ prompt. Build it on Windows with `./scripts/build-parakeet-runtime.ps1`.
 
 The app records 16 kHz mono WAV audio only while the hold key is down. Audio is deleted immediately after transcription and transcript history is never stored.
 
+## Live subtitles
+
+Live subtitles are an independent, opt-in mode for captions from audio playing on the computer. They always start disabled, retain only bounded PCM/transcript state in memory, keep no history, and pause/drop live audio while push-to-talk dictation has priority. On Windows, CPAL 0.18.1 opens the default render endpoint with WASAPI loopback—never a microphone—and normalizes it to bounded 16 kHz mono PCM. The pinned parakeet.cpp v0.4.0 source has a public streaming C API; the `0.4.0-zui.2` runtime patch exposes it through loopback-only session endpoints while reusing the server's loaded model and inference mutex, so captions are incremental and never write audio files. macOS and Linux remain fail-closed until ScreenCaptureKit/PipeWire transports are validated.
+
 ## Architecture
 
 The React UI receives typed state and spectrum events from a Rust controller. Native responsibilities are isolated behind services:

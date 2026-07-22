@@ -5,7 +5,7 @@ use crate::{
     types::{AppError, AppResult, BackendDescriptor, BackendStatus},
 };
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     net::TcpListener,
     path::Path,
@@ -29,6 +29,68 @@ pub struct TranscriptionResult {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct StreamingTranscription {
+    pub text: String,
+    #[serde(default)]
+    pub eou: u8,
+    #[serde(default)]
+    pub eob: u8,
+    #[serde(default)]
+    pub frame_sec: f32,
+    #[serde(default)]
+    pub events: Vec<StreamingEvent>,
+    #[serde(default)]
+    pub words: Vec<StreamingWord>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct StreamingEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub frame: i64,
+    pub t: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct StreamingWord {
+    #[serde(rename = "w")]
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+    pub conf: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamingCreateResponse {
+    id: String,
+}
+
+pub struct StreamingSession {
+    pub id: String,
+    operation: Arc<CancellationSignal>,
+    _lease: StreamLease,
+}
+
+/// Keeps the shared server alive while a live stream exists. Dictation cancellation only cancels
+/// dictation work; this lease prevents idle shutdown or a concurrent dictation cancel from killing
+/// an active subtitle stream.
+#[derive(Debug)]
+struct StreamLease {
+    active_streams: Arc<AtomicU64>,
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        self.active_streams.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+const STREAM_PCM_CONTENT_TYPE: &str = "application/vnd.zui.pcm-f32le";
+const STREAM_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+const STREAM_CANCEL_TIMEOUT: Duration = Duration::from_millis(250);
+const STREAM_CREATE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[async_trait]
 pub trait TranscriptionBackend: Send + Sync {
     fn descriptor(&self) -> BackendDescriptor;
@@ -51,7 +113,8 @@ pub struct ParakeetBackend {
     port: Mutex<Option<u16>>,
     status: RwLock<BackendStatus>,
     ensure_lock: AsyncMutex<()>,
-    cancellation: CancellationSignal,
+    dictation_cancellation: CancellationSignal,
+    active_streams: Arc<AtomicU64>,
     last_used: AtomicU64,
     active_backend_id: RwLock<String>,
 }
@@ -71,10 +134,156 @@ impl ParakeetBackend {
             port: Mutex::new(None),
             status: RwLock::new(BackendStatus::Stopped),
             ensure_lock: AsyncMutex::new(()),
-            cancellation: CancellationSignal::default(),
+            dictation_cancellation: CancellationSignal::default(),
+            active_streams: Arc::new(AtomicU64::new(0)),
             last_used: AtomicU64::new(now_epoch_seconds()),
             active_backend_id: RwLock::new(backend_id.into()),
         }
+    }
+
+    pub async fn stream_create(&self, language: &str) -> AppResult<StreamingSession> {
+        let operation = Arc::new(CancellationSignal::default());
+        self.ensure_ready_unconditionally().await?;
+        let base = self
+            .base_url()
+            .ok_or_else(|| AppError::new("backend_unavailable", "Parakeet is not running."))?;
+        let form = reqwest::multipart::Form::new().text("language", language.to_owned());
+        let request = self
+            .client
+            .post(format!("{base}/v1/audio/streams"))
+            .multipart(form)
+            .timeout(STREAM_OPERATION_TIMEOUT)
+            .send();
+        let generation = operation.generation();
+        let response = match self.run_stream(&operation, request).await {
+            Ok(response) => response,
+            Err(error) => return Err(error),
+        }
+        .error_for_status()
+        .map_err(|error| AppError::new("subtitle_stream_create", error.to_string()))?;
+        let created: StreamingCreateResponse = match response.json().await {
+            Ok(created) => created,
+            Err(error) => return Err(AppError::new("subtitle_stream_protocol", error.to_string())),
+        };
+        if operation.is_cancelled(generation) {
+            // Cancellation can win after the server allocated the stream but before the client
+            // observed its response. Best-effort deletion bounds the server-side orphan.
+            self.cancel_created_stream(&base, &created.id).await;
+            return Err(AppError::new(
+                "subtitle_stream_cancelled",
+                "Live subtitles were stopped.",
+            ));
+        }
+        self.active_streams.fetch_add(1, Ordering::AcqRel);
+        self.last_used.store(now_epoch_seconds(), Ordering::Relaxed);
+        Ok(StreamingSession {
+            id: created.id,
+            operation,
+            _lease: StreamLease {
+                active_streams: self.active_streams.clone(),
+            },
+        })
+    }
+
+    async fn cancel_created_stream(&self, base: &str, id: &str) {
+        let _ = self
+            .client
+            .delete(format!("{base}/v1/audio/streams/{id}"))
+            .timeout(STREAM_CREATE_CLEANUP_TIMEOUT)
+            .send()
+            .await;
+    }
+
+    pub async fn stream_feed(
+        &self,
+        stream: &StreamingSession,
+        pcm: Vec<f32>,
+    ) -> AppResult<StreamingTranscription> {
+        let base = self
+            .base_url()
+            .ok_or_else(|| AppError::new("backend_unavailable", "Parakeet is not running."))?;
+        let bytes = pcm
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let response = self
+            .run_stream(
+                &stream.operation,
+                self.client
+                    .post(format!("{base}/v1/audio/streams/{}/feed", stream.id))
+                    .header(reqwest::header::CONTENT_TYPE, STREAM_PCM_CONTENT_TYPE)
+                    .header("X-Sample-Rate", "16000")
+                    .header("X-Channels", "1")
+                    .body(bytes)
+                    .timeout(STREAM_OPERATION_TIMEOUT)
+                    .send(),
+            )
+            .await?
+            .error_for_status()
+            .map_err(|error| AppError::new("subtitle_stream_feed", error.to_string()))?;
+        self.last_used.store(now_epoch_seconds(), Ordering::Relaxed);
+        response
+            .json()
+            .await
+            .map_err(|error| AppError::new("subtitle_stream_protocol", error.to_string()))
+    }
+
+    pub async fn stream_finalize(
+        &self,
+        stream: &StreamingSession,
+    ) -> AppResult<StreamingTranscription> {
+        self.stream_json(stream, "finalize").await
+    }
+
+    pub async fn stream_cancel(&self, stream: &StreamingSession) {
+        stream.operation.cancel();
+        if let Some(base) = self.base_url() {
+            let _ = self
+                .client
+                .delete(format!("{base}/v1/audio/streams/{}", stream.id))
+                .timeout(STREAM_CANCEL_TIMEOUT)
+                .send()
+                .await;
+        }
+    }
+
+    async fn stream_json(
+        &self,
+        stream: &StreamingSession,
+        operation: &str,
+    ) -> AppResult<StreamingTranscription> {
+        let base = self
+            .base_url()
+            .ok_or_else(|| AppError::new("backend_unavailable", "Parakeet is not running."))?;
+        let response = self
+            .run_stream(
+                &stream.operation,
+                self.client
+                    .post(format!("{base}/v1/audio/streams/{}/{operation}", stream.id))
+                    .timeout(STREAM_OPERATION_TIMEOUT)
+                    .send(),
+            )
+            .await?
+            .error_for_status()
+            .map_err(|error| AppError::new("subtitle_stream_finalize", error.to_string()))?;
+        response
+            .json()
+            .await
+            .map_err(|error| AppError::new("subtitle_stream_protocol", error.to_string()))
+    }
+
+    async fn run_stream<T>(
+        &self,
+        signal: &CancellationSignal,
+        future: impl std::future::Future<Output = Result<T, reqwest::Error>>,
+    ) -> AppResult<T> {
+        signal
+            .run(signal.generation(), future)
+            .await
+            .ok_or_else(|| {
+                AppError::new("subtitle_stream_cancelled", "Live subtitles were stopped.")
+            })?
+            .map_err(|error| AppError::new("subtitle_stream_transport", error.to_string()))
     }
 
     pub fn backend_id(&self) -> String {
@@ -93,6 +302,12 @@ impl ParakeetBackend {
         }
         if self.backend_id() == backend_id {
             return Ok(());
+        }
+        if self.has_active_streams() {
+            return Err(AppError::new(
+                "subtitles_active",
+                "Stop live subtitles before changing the local speech engine.",
+            ));
         }
         self.cancel();
         let _guard = self.ensure_lock.lock().await;
@@ -246,13 +461,49 @@ impl ParakeetBackend {
         Self::cancelled_error()
     }
 
+    async fn ensure_ready_unconditionally(&self) -> AppResult<()> {
+        let _guard = self.ensure_lock.lock().await;
+        if self.health().await {
+            self.set_status(BackendStatus::Ready);
+            return Ok(());
+        }
+        self.set_status(BackendStatus::Loading);
+        self.shutdown_process()?;
+        self.spawn_server()?;
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(120) {
+            if !self.process_is_alive() {
+                self.set_status(BackendStatus::Error);
+                return Err(AppError::new(
+                    "backend_exited",
+                    "Parakeet stopped while loading the model.",
+                ));
+            }
+            if self.health().await {
+                self.set_status(BackendStatus::Ready);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let _ = self.shutdown_process();
+        self.set_status(BackendStatus::Error);
+        Err(AppError::new(
+            "backend_timeout",
+            "Parakeet did not become ready within two minutes.",
+        ))
+    }
+
+    pub fn has_active_streams(&self) -> bool {
+        self.active_streams.load(Ordering::Acquire) != 0
+    }
+
     async fn ensure_ready_for(&self, generation: u64) -> AppResult<()> {
         let _guard = self.ensure_lock.lock().await;
-        if self.cancellation.is_cancelled(generation) {
+        if self.dictation_cancellation.is_cancelled(generation) {
             return Err(Self::cancelled_error());
         }
         let healthy = self
-            .cancellation
+            .dictation_cancellation
             .run(generation, self.health())
             .await
             .ok_or_else(|| self.cancelled_startup_error())?;
@@ -266,7 +517,7 @@ impl ParakeetBackend {
             self.set_status(BackendStatus::Error);
             return Err(error);
         }
-        if self.cancellation.is_cancelled(generation) {
+        if self.dictation_cancellation.is_cancelled(generation) {
             return Err(Self::cancelled_error());
         }
         if let Err(error) = self.spawn_server() {
@@ -276,7 +527,7 @@ impl ParakeetBackend {
 
         let started = tokio::time::Instant::now();
         while started.elapsed() < Duration::from_secs(120) {
-            if self.cancellation.is_cancelled(generation) {
+            if self.dictation_cancellation.is_cancelled(generation) {
                 return Err(self.cancelled_startup_error());
             }
             if !self.process_is_alive() {
@@ -287,7 +538,7 @@ impl ParakeetBackend {
                 ));
             }
             let healthy = self
-                .cancellation
+                .dictation_cancellation
                 .run(generation, self.health())
                 .await
                 .ok_or_else(|| self.cancelled_startup_error())?;
@@ -295,7 +546,7 @@ impl ParakeetBackend {
                 self.set_status(BackendStatus::Ready);
                 return Ok(());
             }
-            self.cancellation
+            self.dictation_cancellation
                 .run(generation, tokio::time::sleep(Duration::from_millis(250)))
                 .await
                 .ok_or_else(|| self.cancelled_startup_error())?;
@@ -359,7 +610,8 @@ impl TranscriptionBackend for ParakeetBackend {
     }
 
     async fn ensure_ready(&self) -> AppResult<()> {
-        self.ensure_ready_for(self.cancellation.generation()).await
+        self.ensure_ready_for(self.dictation_cancellation.generation())
+            .await
     }
 
     async fn health(&self) -> bool {
@@ -381,11 +633,11 @@ impl TranscriptionBackend for ParakeetBackend {
         &self,
         request: TranscriptionRequest<'_>,
     ) -> AppResult<TranscriptionResult> {
-        let generation = self.cancellation.generation();
+        let generation = self.dictation_cancellation.generation();
         self.ensure_ready_for(generation).await?;
         self.last_used.store(now_epoch_seconds(), Ordering::Relaxed);
         let audio = self
-            .cancellation
+            .dictation_cancellation
             .run(generation, tokio::fs::read(request.audio_path))
             .await
             .ok_or_else(Self::cancelled_error)?
@@ -395,7 +647,7 @@ impl TranscriptionBackend for ParakeetBackend {
             .ok_or_else(|| AppError::new("backend_unavailable", "Parakeet is not running."))?;
         let request = transcription_request(&self.client, &base, audio, request.language)?.send();
         let response = self
-            .cancellation
+            .dictation_cancellation
             .run(generation, request)
             .await
             .ok_or_else(Self::cancelled_error)?
@@ -403,7 +655,7 @@ impl TranscriptionBackend for ParakeetBackend {
             .error_for_status()
             .map_err(|e| AppError::new("transcription_failed", e.to_string()))?;
         let result: TranscriptionResponse = self
-            .cancellation
+            .dictation_cancellation
             .run(generation, response.json())
             .await
             .ok_or_else(Self::cancelled_error)?
@@ -417,10 +669,16 @@ impl TranscriptionBackend for ParakeetBackend {
     }
 
     fn cancel(&self) {
-        self.cancellation.cancel();
+        self.dictation_cancellation.cancel();
     }
 
     async fn shutdown(&self) -> AppResult<()> {
+        if self.has_active_streams() {
+            return Err(AppError::new(
+                "subtitles_active",
+                "Stop live subtitles before unloading the local speech engine.",
+            ));
+        }
         self.cancel();
         let _guard = self.ensure_lock.lock().await;
         self.shutdown_process()

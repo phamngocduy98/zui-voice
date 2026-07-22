@@ -3,12 +3,14 @@ use crate::{
     audio::AudioRecorder,
     backend::{ParakeetBackend, TranscriptionBackend, TranscriptionRequest},
     clipboard::{ClipboardService, Delivery},
+    inference::InferenceArbiter,
     models,
     platform::{
         capture_foreground, hide_overlay, is_wayland, platform_name, position_and_show_overlay,
         prepare_overlay_error, ForegroundTarget,
     },
     settings::SettingsStore,
+    subtitles::SubtitleRuntime,
     types::{
         AppError, AppResult, AppSettings, AppSnapshot, BackendStatus, DictationState, SetupStatus,
         CURRENT_ONBOARDING_VERSION,
@@ -34,6 +36,9 @@ pub struct AppRuntime {
     state: RwLock<DictationState>,
     transition: Mutex<()>,
     settings_update: tokio::sync::Mutex<()>,
+    subtitle_preferences_update: Mutex<()>,
+    subtitle_position_revision: AtomicU64,
+    ignoring_programmatic_subtitle_move: AtomicBool,
     activation: ActivationGate,
     model_unloading: AtomicBool,
     microphone_verified: AtomicBool,
@@ -42,6 +47,8 @@ pub struct AppRuntime {
     next_session: AtomicU64,
     current_session: AtomicU64,
     target: Mutex<Option<(u64, ForegroundTarget)>>,
+    pub subtitles: SubtitleRuntime,
+    inference: Arc<InferenceArbiter>,
 }
 
 #[derive(Default)]
@@ -136,6 +143,9 @@ impl AppRuntime {
             state: RwLock::new(initial),
             transition: Mutex::new(()),
             settings_update: tokio::sync::Mutex::new(()),
+            subtitle_preferences_update: Mutex::new(()),
+            subtitle_position_revision: AtomicU64::new(0),
+            ignoring_programmatic_subtitle_move: AtomicBool::new(false),
             activation: ActivationGate::default(),
             model_unloading: AtomicBool::new(false),
             microphone_verified: AtomicBool::new(false),
@@ -144,6 +154,8 @@ impl AppRuntime {
             next_session: AtomicU64::new(0),
             current_session: AtomicU64::new(0),
             target: Mutex::new(None),
+            subtitles: SubtitleRuntime::new(app),
+            inference: Arc::new(InferenceArbiter::default()),
         }))
     }
 
@@ -166,6 +178,8 @@ impl AppRuntime {
             setup_complete,
             platform: platform_name(),
             wayland: is_wayland(),
+            subtitle_state: self.subtitles.state(),
+            system_audio_capabilities: self.subtitles.capabilities(),
         }
     }
 
@@ -173,17 +187,118 @@ impl AppRuntime {
         self.assets.status(&self.settings.get().backend_id)
     }
 
+    pub fn start_subtitles(&self) -> AppResult<AppSnapshot> {
+        self.subtitles.start(
+            self.backend.clone(),
+            self.inference.clone(),
+            self.settings.get().locale,
+        )?;
+        Ok(self.snapshot())
+    }
+
+    pub fn stop_subtitles(&self) -> AppResult<AppSnapshot> {
+        self.subtitles.stop()?;
+        Ok(self.snapshot())
+    }
+
+    pub fn set_subtitle_overlay_locked(&self, locked: bool) -> AppResult<AppSnapshot> {
+        let _update = self
+            .subtitle_preferences_update
+            .lock()
+            .expect("subtitle preference lock poisoned");
+        // Persist first: if persistence fails, retain the existing native click-through state.
+        let previous = self.settings.get().subtitles.overlay_locked;
+        self.settings
+            .update(|settings| settings.subtitles.overlay_locked = locked)?;
+        if let Err(error) = self.subtitles.set_locked(locked) {
+            let _ = self
+                .settings
+                .update(|settings| settings.subtitles.overlay_locked = previous);
+            return Err(error);
+        }
+        Ok(self.snapshot())
+    }
+
+    pub fn reset_subtitle_overlay_position(&self) -> AppResult<AppSnapshot> {
+        let _update = self
+            .subtitle_preferences_update
+            .lock()
+            .expect("subtitle preference lock poisoned");
+        self.ignoring_programmatic_subtitle_move
+            .store(true, Ordering::Release);
+        let result = self.subtitles.reset_position();
+        self.ignoring_programmatic_subtitle_move
+            .store(false, Ordering::Release);
+        result?;
+        self.settings
+            .update(|settings| settings.subtitles.position = None)?;
+        Ok(self.snapshot())
+    }
+
+    pub fn restore_subtitle_position(&self) {
+        let settings = self.settings.get();
+        self.ignoring_programmatic_subtitle_move
+            .store(true, Ordering::Release);
+        let _ = self.subtitles.restore_position(&settings.subtitles);
+        self.ignoring_programmatic_subtitle_move
+            .store(false, Ordering::Release);
+    }
+
+    pub fn subtitle_window_moved(self: &Arc<Self>) {
+        if self
+            .ignoring_programmatic_subtitle_move
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let revision = self
+            .subtitle_position_revision
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        let runtime = self.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            if runtime.subtitle_position_revision.load(Ordering::Acquire) != revision
+                || runtime
+                    .ignoring_programmatic_subtitle_move
+                    .load(Ordering::Acquire)
+            {
+                return;
+            }
+            let Ok(position) = runtime.subtitles.current_position() else {
+                return;
+            };
+            let _guard = runtime
+                .subtitle_preferences_update
+                .lock()
+                .expect("subtitle preference lock poisoned");
+            let _ = runtime
+                .settings
+                .update(|settings| settings.subtitles.position = Some(position));
+        });
+    }
+
+    pub fn shutdown_subtitles(&self) {
+        let _ = self.subtitles.stop();
+    }
+
     pub fn set_state(&self, state: DictationState) {
         *self.state.write().expect("state lock poisoned") = state.clone();
         let _ = self.app.emit("voice://state", state);
     }
 
-    pub async fn update_settings(&self, settings: AppSettings) -> AppResult<AppSnapshot> {
+    pub async fn update_settings(&self, mut settings: AppSettings) -> AppResult<AppSnapshot> {
         let _update = self.settings_update.lock().await;
         let previous = self.settings.get();
         let backend_changed = previous.backend_id != settings.backend_id;
         let locale_changed = previous.locale != settings.locale;
         let hotkey_changed = previous.hotkey.key != settings.hotkey.key;
+        if (backend_changed || locale_changed) && self.subtitles.is_active() {
+            return Err(AppError::new(
+                "subtitles_active",
+                "Stop live subtitles before changing the model or language.",
+            ));
+        }
         if (backend_changed || locale_changed || hotkey_changed) && self.activation.is_busy() {
             return Err(AppError::new(
                 "dictation_active",
@@ -193,13 +308,39 @@ impl AppRuntime {
         if backend_changed {
             self.backend.switch_backend(&settings.backend_id).await?;
         }
-        if let Err(error) = self.settings.save(settings.clone()) {
-            if backend_changed {
-                if let Err(rollback) = self.backend.switch_backend(&previous.backend_id).await {
-                    eprintln!("Zui. Voice could not restore the previous backend: {rollback}");
+        // Keep full-settings persistence mutually exclusive with native lock/move updates and
+        // refresh the protected fields inside that boundary, not before awaiting backend work.
+        let persisted_settings = {
+            let _subtitle_preferences = self
+                .subtitle_preferences_update
+                .lock()
+                .expect("subtitle preference lock poisoned");
+            let current = self.settings.get();
+            settings.subtitles.overlay_locked = current.subtitles.overlay_locked;
+            settings.subtitles.position = current.subtitles.position.clone();
+            self.settings
+                .save(settings.clone())
+                .map(|()| settings.clone())
+        };
+        let persisted_settings = match persisted_settings {
+            Ok(settings) => settings,
+            Err(error) => {
+                if backend_changed {
+                    if let Err(rollback) = self.backend.switch_backend(&previous.backend_id).await {
+                        eprintln!("Zui. Voice could not restore the previous backend: {rollback}");
+                    }
                 }
+                return Err(error);
             }
-            return Err(error);
+        };
+        let subtitle_settings_changed = previous.subtitles.overlay_locked
+            != persisted_settings.subtitles.overlay_locked
+            || previous.subtitles.max_lines != persisted_settings.subtitles.max_lines
+            || previous.subtitles.position != persisted_settings.subtitles.position;
+        if subtitle_settings_changed {
+            let _ = self
+                .app
+                .emit("subtitle://settings", persisted_settings.subtitles.clone());
         }
         let should_cancel = previous.enabled && !settings.enabled;
         if should_cancel {
@@ -296,11 +437,19 @@ impl AppRuntime {
     }
 
     pub async fn unload_model(&self) -> AppResult<AppSnapshot> {
+        if self.subtitles.is_active() {
+            return Err(AppError::new(
+                "subtitles_active",
+                "Stop live subtitles before unloading the local speech engine.",
+            ));
+        }
         self.model_unloading.store(true, Ordering::Release);
         {
             let _transition = self.transition.lock().expect("transition lock poisoned");
             self.current_session.store(0, Ordering::Release);
-            let _ = self.activation.cancel();
+            if self.activation.cancel().is_some() {
+                self.inference.end_dictation();
+            }
             self.recorder.cancel();
             self.backend.cancel();
             self.target.lock().expect("target lock poisoned").take();
@@ -347,6 +496,7 @@ impl AppRuntime {
             return;
         }
         self.current_session.store(session, Ordering::Release);
+        self.inference.begin_dictation();
         *self.target.lock().expect("target lock poisoned") = Some((session, capture_foreground()));
         if let Err(error) = position_and_show_overlay(&self.app) {
             self.fail_locked(session, error);
@@ -397,6 +547,7 @@ impl AppRuntime {
             return;
         }
         self.current_session.store(0, Ordering::Release);
+        self.inference.end_dictation();
         self.recorder.cancel();
         self.backend.cancel();
         self.target.lock().expect("target lock poisoned").take();
@@ -504,6 +655,7 @@ impl AppRuntime {
             if !self.activation.complete(session) {
                 return;
             }
+            self.inference.end_dictation();
         }
         let runtime = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -535,6 +687,7 @@ impl AppRuntime {
         if !self.activation.complete(session) {
             return;
         }
+        self.inference.end_dictation();
         let runtime = self.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -578,6 +731,7 @@ impl AppRuntime {
                 let timeout = runtime.settings.get().model_idle_timeout_seconds;
                 let idle = now_epoch_seconds().saturating_sub(runtime.backend.last_used());
                 if !runtime.activation.is_busy()
+                    && !runtime.backend.has_active_streams()
                     && runtime.backend.status() == BackendStatus::Ready
                     && idle >= timeout
                 {

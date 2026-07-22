@@ -7,7 +7,8 @@ $PSNativeCommandUseErrorActionPreference = $true
 $repository = "https://github.com/mudler/parakeet.cpp.git"
 $commit = "e8acc6172a94e20a952cf1843decace5d771a94b"
 $work = Join-Path ([System.IO.Path]::GetTempPath()) "zui-parakeet-$commit"
-$patch = Join-Path $PSScriptRoot "..\patches\parakeet-server-language.patch"
+$languagePatch = Join-Path $PSScriptRoot "..\patches\parakeet-server-language.patch"
+$streamingPatch = Join-Path $PSScriptRoot "..\patches\parakeet-server-streaming.patch"
 
 if (Test-Path -LiteralPath $work) {
     Remove-Item -LiteralPath $work -Recurse -Force
@@ -16,12 +17,14 @@ if (Test-Path -LiteralPath $work) {
 git clone --recursive $repository $work
 git -C $work checkout $commit
 git -C $work submodule update --init --recursive
-git -C $work apply --check $patch
-git -C $work apply $patch
+git -C $work apply --check $languagePatch
+git -C $work apply $languagePatch
+git -C $work apply --check $streamingPatch
+git -C $work apply $streamingPatch
 
 $build = Join-Path $work "build"
 cmake -S $work -B $build -A x64 `
-    "-DPARAKEET_VERSION=0.4.0-zui.1" `
+    "-DPARAKEET_VERSION=0.4.0-zui.2" `
     "-DPARAKEET_BUILD_CLI=OFF" `
     "-DPARAKEET_BUILD_SERVER=ON" `
     "-DPARAKEET_BUILD_TESTS=OFF" `
@@ -34,6 +37,8 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $binary = Join-Path $build "examples\server\Release\parakeet-server.exe"
 $destination = Join-Path $OutputDirectory "parakeet-server.exe"
 Copy-Item -LiteralPath $binary -Destination $destination -Force
+$engineVersionMarker = Join-Path $OutputDirectory ".parakeet-engine-version"
+[System.IO.File]::WriteAllText($engineVersionMarker, "0.4.0-zui.2`n", [System.Text.UTF8Encoding]::new($false))
 
 $file = Get-Item -LiteralPath $destination
 $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()

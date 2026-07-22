@@ -28,6 +28,9 @@ pub const SERVER_FILENAME: &str = "parakeet-server.exe";
 #[cfg(not(windows))]
 pub const SERVER_FILENAME: &str = "parakeet-server";
 
+const ENGINE_VERSION_MARKER: &str = ".parakeet-engine-version";
+const REQUIRED_ENGINE_VERSION: &str = "0.4.0-zui.2";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseManifest {
@@ -79,6 +82,7 @@ impl AssetManager {
         for backend in models::BACKENDS {
             recover_interrupted_install(&install_dir.join(backend.model_filename))?;
         }
+        ensure_development_engine_marker()?;
         Ok(Self {
             app: app.clone(),
             install_dir,
@@ -102,7 +106,13 @@ impl AssetManager {
     pub fn resolve_paths(&self, backend_id: &str) -> Option<BackendPaths> {
         self.path_candidates(backend_id)
             .into_iter()
-            .find(|paths| paths.server.is_file() && paths.model.is_file())
+            .find(|paths| self.paths_match_required_engine(paths))
+    }
+
+    fn paths_match_required_engine(&self, paths: &BackendPaths) -> bool {
+        paths.server.is_file()
+            && paths.model.is_file()
+            && engine_version_matches(&paths.server, REQUIRED_ENGINE_VERSION)
     }
 
     pub fn server_path(&self) -> Option<PathBuf> {
@@ -135,7 +145,7 @@ impl AssetManager {
         let candidates = self.path_candidates(backend_id);
         let complete_paths = candidates
             .iter()
-            .find(|paths| paths.server.is_file() && paths.model.is_file());
+            .find(|paths| self.paths_match_required_engine(paths));
         let server_path = candidates
             .iter()
             .find(|paths| paths.server.is_file())
@@ -238,10 +248,12 @@ impl AssetManager {
         let arch = std::env::consts::ARCH;
         let selected = select_asset_set(&manifest, platform, arch, backend_id)?;
 
+        let engine_version = manifest.engine_version.clone();
         for asset in selected {
             self.ensure_not_cancelled(generation)?;
             self.download_asset(&client, asset, generation).await?;
         }
+        self.write_engine_version(&engine_version).await?;
         Ok(self.status(backend_id))
     }
 
@@ -408,6 +420,13 @@ impl AssetManager {
         self.cancellation.cancel();
     }
 
+    async fn write_engine_version(&self, version: &str) -> AppResult<()> {
+        let path = self.install_dir.join(ENGINE_VERSION_MARKER);
+        tokio::fs::write(path, version.trim())
+            .await
+            .map_err(|error| AppError::new("asset_install", error.to_string()))
+    }
+
     fn emit_progress(&self, phase: DownloadPhase, asset: &str, received: u64, total: Option<u64>) {
         let percent = total
             .filter(|total| *total > 0)
@@ -438,6 +457,24 @@ impl AssetManager {
             .await
             .ok_or_else(download_cancelled)?
     }
+}
+
+/// Development builds use the locally-built runtime from `<workspace>/bin`; write the same
+/// compatibility marker that release installation writes so a verified local runtime is usable.
+fn ensure_development_engine_marker() -> AppResult<()> {
+    #[cfg(debug_assertions)]
+    {
+        for root in development_roots() {
+            let directory = root.join("bin");
+            let server = directory.join(SERVER_FILENAME);
+            let marker = directory.join(ENGINE_VERSION_MARKER);
+            if server.is_file() && !engine_version_matches(&server, REQUIRED_ENGINE_VERSION) {
+                fs::write(marker, REQUIRED_ENGINE_VERSION)
+                    .map_err(|error| AppError::new("asset_marker", error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn development_roots() -> Vec<PathBuf> {
@@ -525,6 +562,13 @@ fn select_asset_set<'a>(
         ));
     }
     Ok([runtimes[0], model_assets[0]])
+}
+
+fn engine_version_matches(server: &Path, required: &str) -> bool {
+    server.parent().is_some_and(|directory| {
+        fs::read_to_string(directory.join(ENGINE_VERSION_MARKER))
+            .is_ok_and(|installed| installed.trim() == required)
+    })
 }
 
 fn backup_path(destination: &Path) -> PathBuf {
@@ -843,6 +887,21 @@ mod tests {
             .code,
             "manifest_filename"
         );
+    }
+
+    #[test]
+    fn zui_1_engine_marker_cannot_satisfy_zui_2() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let server = directory.path().join(SERVER_FILENAME);
+        fs::write(&server, b"runtime").expect("runtime");
+        fs::write(directory.path().join(ENGINE_VERSION_MARKER), "0.4.0-zui.1").expect("old marker");
+        assert!(!engine_version_matches(&server, REQUIRED_ENGINE_VERSION));
+        fs::write(
+            directory.path().join(ENGINE_VERSION_MARKER),
+            REQUIRED_ENGINE_VERSION,
+        )
+        .expect("new marker");
+        assert!(engine_version_matches(&server, REQUIRED_ENGINE_VERSION));
     }
 
     #[test]
