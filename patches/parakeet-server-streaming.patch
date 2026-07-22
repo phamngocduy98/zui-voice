@@ -11,7 +11,7 @@ index 4187ed2..33975c8 100644
  #include "transcription.hpp"  // pk::Transcription
  #include "ggml_graph.hpp"     // pk::set_num_threads, pk::shutdown_backend
  #include "dr_wav.h"           // declarations only; impl lives in libparakeet
-
+ 
 +#include <algorithm>
 +#include <array>
 +#include <atomic>
@@ -24,7 +24,8 @@ index 4187ed2..33975c8 100644
 +#include <unordered_map>
  #include <string>
  #include <vector>
-@@ -20,6 +25,63 @@ namespace {
+@@ -20,6 +25,63 @@
+ namespace {
  httplib::Server* g_server = nullptr;
  void on_signal(int) { if (g_server) g_server->stop(); }
  
@@ -88,7 +89,8 @@ index 4187ed2..33975c8 100644
  // Decode WAV bytes in memory into mono float PCM. Returns false if the bytes
  // are not a decodable, non-empty WAV (so a bad/empty upload becomes a 400, not
  // a 500 from the inference path). The model resamples to 16 kHz internally, so
-@@ -109,3 +155,12 @@ int main(int argc, char** argv) {
+@@ -109,3 +155,12 @@
+ int main(int argc, char** argv) {
      std::mutex infer_mu;
 +    std::unordered_map<std::string, std::unique_ptr<StreamState>> streams;
 +    std::atomic<unsigned long long> next_stream_id{0};
@@ -101,7 +103,8 @@ index 4187ed2..33975c8 100644
 +    };
 
      httplib::Server svr;
-@@ -169,6 +217,46 @@ int main(int argc, char** argv) {
+@@ -169,6 +217,46 @@
+ int main(int argc, char** argv) {
          }
      });
  
